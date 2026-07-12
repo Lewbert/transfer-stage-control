@@ -63,23 +63,23 @@ and **on-screen buttons**.
 
 #### D-Pad
 
-| Button | Stage | Axis | Direction | Notes
-|---|---|---|
-| **D-Pad ↑** | Current stage¹ | Y | Positive (+) | Long press → continuous
-| **D-Pad ↓** | Current stage¹ | Y | Negative (−) | Short press → single step
-| **D-Pad ←** | Current stage¹ | X | Negative (−) |
-| **D-Pad →** | Current stage¹ | X | Positive (+) |
+| Button | Stage | Axis | Direction | Notes |
+| --- | --- | --- | --- | --- |
+| **D-Pad ↑** | Current stage¹ | Y | Positive (+) | Long press → continuous |
+| **D-Pad ↓** | Current stage¹ | Y | Negative (−) | Short press → single step |
+| **D-Pad ←** | Current stage¹ | X | Negative (−) | |
+| **D-Pad →** | Current stage¹ | X | Positive (+) | |
 
-¹ D-Pad stage toggles between SigmaKoki and Zolix via **Back** button.
+¹ D-pad stage toggles between SigmaKoki and Zolix via **Back** button.
 
 #### Face Buttons
 
-| Button | Stage | Axis | Direction | Notes
-|---|---|---|
-| **A** | SigmaKoki | Z | Positive (+) | Long press → continuous
-| **B** | SigmaKoki | Z | Negative (−) | Short press → single step
-| **X** | Zolix | R (rotate) | Negative (−) |
-| **Y** | Zolix | R (rotate) | Positive (+) |
+| Button | Stage | Axis | Direction | Notes |
+| --- | --- | --- | --- | --- |
+| **A** | SigmaKoki | Z | Positive (+) | Long press → continuous |
+| **B** | SigmaKoki | Z | Negative (−) | Short press → single step |
+| **X** | Zolix | R (rotate) | Negative (−) | |
+| **Y** | Zolix | R (rotate) | Positive (+) | |
 
 #### Triggers & Special
 
