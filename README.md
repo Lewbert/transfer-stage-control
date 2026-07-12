@@ -8,11 +8,11 @@ and **on-screen buttons**.
 
 ## Instruments
 
-| Instrument | Controller | Protocol | Default Baud |
+| Instrument | Controller | Protocol | Default Baud
 |---|---|---|---|
-| **SigmaKoki XYZ Stage** | Arduino (ATmega328P) | Text commands over USB UART | 115200 |
-| **Zolix XYR Stage** | ZC300 | MODBUS-RTU over RS-485 | 115200 |
-| **Yudian AI-828** | AI-828 | MODBUS-RTU over RS-485 | 9600 |
+| **SigmaKoki XYZ Stage** | Arduino (ATmega328P) | Text commands over USB UART | 115200
+| **Zolix XYR Stage** | ZC300 | MODBUS-RTU over RS-485 | 115200
+| **Yudian AI-828** | AI-828 | MODBUS-RTU over RS-485 | 9600
 
 ## Features
 
@@ -35,60 +35,60 @@ and **on-screen buttons**.
 
 ### Keyboard
 
-| Input | Stage | Axis | Direction | Notes |
+| Input | Stage | Axis | Direction | Notes
 |---|---|---|---|---|
-| **W** | SigmaKoki | Y | Positive (+) | Hold Shift for fast |
-| **S** | SigmaKoki | Y | Negative (−) | |
-| **A** | SigmaKoki | X | Negative (−) | |
-| **D** | SigmaKoki | X | Positive (+) | |
-| **↑** (Up) | Zolix | Y | Positive (+) | Hold Shift for fast |
-| **↓** (Down) | Zolix | Y | Negative (−) | |
-| **←** (Left) | Zolix | X | Negative (−) | |
-| **→** (Right) | Zolix | X | Positive (+) | |
-| **Q** | Zolix | R (rotate) | Negative (−) | |
-| **E** | Zolix | R (rotate) | Positive (+) | |
-| **U** | SigmaKoki | Z | Positive (+) | |
-| **J** | SigmaKoki | Z | Negative (−) | |
-| **Shift** | — | — | Fast speed | Hold while pressing direction keys |
-| **Esc** | — | — | **STOP ALL** | Emergency stop — stops both stages |
+| **W** | SigmaKoki | Y | Positive (+) | Hold Shift for fast
+| **S** | SigmaKoki | Y | Negative (−) |
+| **A** | SigmaKoki | X | Negative (−) |
+| **D** | SigmaKoki | X | Positive (+) |
+| **↑** (Up) | Zolix | Y | Positive (+) | Hold Shift for fast
+| **↓** (Down) | Zolix | Y | Negative (−) |
+| **←** (Left) | Zolix | X | Negative (−) |
+| **→** (Right) | Zolix | X | Positive (+) |
+| **Q** | Zolix | R (rotate) | Negative (−) |
+| **E** | Zolix | R (rotate) | Positive (+) |
+| **U** | SigmaKoki | Z | Positive (+) |
+| **J** | SigmaKoki | Z | Negative (−) |
+| **Shift** | — | — | Fast speed | Hold while pressing direction keys
+| **Esc** | — | — | **STOP ALL** | Emergency stop — stops both stages
 
 ### Gamepad (Xbox layout)
 
 #### Sticks
 
-| Control | Stage | Axes | Behavior |
+| Control | Stage | Axes | Behavior
 |---|---|---|---|
-| **Left Stick** | SigmaKoki | X / Y | Analog speed — continuous, proportional to deflection |
-| **Right Stick** | Zolix | X / Y | 8-direction — wide cardinals, narrow diagonals |
+| **Left Stick** | SigmaKoki | X / Y | Analog speed — continuous, proportional to deflection
+| **Right Stick** | Zolix | X / Y | 8-direction — wide cardinals, narrow diagonals
 
 #### D-Pad
 
-| Button | Stage | Axis | Direction | Notes |
+| Button | Stage | Axis | Direction | Notes
 |---|---|---|
-| **D-Pad ↑** | Current stage¹ | Y | Positive (+) | Long press → continuous |
-| **D-Pad ↓** | Current stage¹ | Y | Negative (−) | Short press → single step |
-| **D-Pad ←** | Current stage¹ | X | Negative (−) | |
-| **D-Pad →** | Current stage¹ | X | Positive (+) | |
+| **D-Pad ↑** | Current stage¹ | Y | Positive (+) | Long press → continuous
+| **D-Pad ↓** | Current stage¹ | Y | Negative (−) | Short press → single step
+| **D-Pad ←** | Current stage¹ | X | Negative (−) |
+| **D-Pad →** | Current stage¹ | X | Positive (+) |
 
 ¹ D-Pad stage toggles between SigmaKoki and Zolix via **Back** button.
 
 #### Face Buttons
 
-| Button | Stage | Axis | Direction | Notes |
+| Button | Stage | Axis | Direction | Notes
 |---|---|---|
-| **A** | SigmaKoki | Z | Positive (+) | Long press → continuous |
-| **B** | SigmaKoki | Z | Negative (−) | Short press → single step |
-| **X** | Zolix | R (rotate) | Negative (−) | |
-| **Y** | Zolix | R (rotate) | Positive (+) | |
+| **A** | SigmaKoki | Z | Positive (+) | Long press → continuous
+| **B** | SigmaKoki | Z | Negative (−) | Short press → single step
+| **X** | Zolix | R (rotate) | Negative (−) |
+| **Y** | Zolix | R (rotate) | Positive (+) |
 
 #### Triggers & Special
 
-| Button | Action |
+| Button | Action
 |---|---|
-| **Left Trigger (LT)** | Fast speed for SigmaKoki (left stick, D-pad, face buttons A/B) |
-| **Right Trigger (RT)** | Fast speed for Zolix (right stick, D-pad, face buttons X/Y) |
-| **Back** | Toggle D-pad stage assignment (SigmaKoki ↔ Zolix) |
-| **Start** | Toggle enable/disable for the D-pad-assigned stage |
+| **Left Trigger (LT)** | Fast speed for SigmaKoki (left stick, D-pad, face buttons A/B)
+| **Right Trigger (RT)** | Fast speed for Zolix (right stick, D-pad, face buttons X/Y)
+| **Back** | Toggle D-pad stage assignment (SigmaKoki ↔ Zolix)
+| **Start** | Toggle enable/disable for the D-pad-assigned stage
 
 ---
 
@@ -98,8 +98,8 @@ Each stage panel has a 4×2 directional button grid with press-and-hold continuo
 and click-for-single-step behavior:
 
 ```
- X+ │ X- 
- Y+ │ Y- 
+ X+ │ X-
+ Y+ │ Y-
 Z+/R+│Z-/R-
 STOP│ZERO
 ```
@@ -114,11 +114,11 @@ STOP│ZERO
 
 Each axis pair has independently configurable slow and fast speeds:
 
-| Setting | Stage | Axes |
+| Setting | Stage | Axes
 |---|---|---|
-| XY Slow / Fast | Both | X, Y |
-| Z Slow / Fast | SigmaKoki | Z |
-| R Slow / Fast | Zolix | R |
+| XY Slow / Fast | Both | X, Y
+| Z Slow / Fast | SigmaKoki | Z
+| R Slow / Fast | Zolix | R
 
 Fast mode is activated by:
 - **Keyboard**: holding **Shift**
@@ -133,7 +133,7 @@ for gamepad controls. For keyboard, release and re-press the key to apply the ne
 
 The status table shows positions in two units side by side:
 
-| Axis | Steps | µm / ° |
+| Axis | Steps | µm / °
 |---|---|---|
 
 - **Steps** — raw pulse count from the controller
@@ -153,13 +153,13 @@ alongside the executable (auto-generated on first run).
 
 ### Tabs
 
-| Tab | Contents |
+| Tab | Contents
 |---|---|
-| **SigmaKoki XYZ** | COM port, baudrate, speed, step, display, axis inversion |
-| **Zolix XYR** | COM port, baudrate, slave address, speed, step, display, axis inversion |
-| **Temperature** | COM port, baudrate, slave address, safety limits |
-| **Gamepad** | Trigger threshold, stick inversion |
-| **Input** | Long-press threshold, loop rate, status poll rate |
+| **SigmaKoki XYZ** | COM port, baudrate, speed, step, display, axis inversion
+| **Zolix XYR** | COM port, baudrate, slave address, speed, step, display, axis inversion
+| **Temperature** | COM port, baudrate, slave address, safety limits
+| **Gamepad** | Trigger threshold, stick inversion
+| **Input** | Long-press threshold, loop rate, status poll rate
 
 ---
 
@@ -252,10 +252,10 @@ This project is licensed under the **MIT License** — see [LICENSE](LICENSE) fo
 
 This project uses the following open-source libraries:
 
-| Library | Version | License |
+| Library | Version | License
 |---|---|---|
-| [pyserial](https://github.com/pyserial/pyserial) | 3.5 | BSD 3-Clause |
-| [PyInstaller](https://github.com/pyinstaller/pyinstaller) | 6.3 | GPL with linking exception |
+| [pyserial](https://github.com/pyserial/pyserial) | 3.5 | BSD 3-Clause
+| [PyInstaller](https://github.com/pyinstaller/pyinstaller) | 6.3 | GPL with linking exception
 
 **pyserial** — Copyright (c) 2001-2020 Chris Liechti. Redistribution and use in
 source and binary forms, with or without modification, are permitted provided
