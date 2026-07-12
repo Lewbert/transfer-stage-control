@@ -1,0 +1,8 @@
+name: transfer_stage
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pyserial=3.5
+  - pyinstaller=6.3

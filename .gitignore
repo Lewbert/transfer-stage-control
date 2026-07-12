@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller
+build/
+dist/
+
+# Runtime
+settings.json
+*.log
+
+# IDE
+.vscode/
+
+# OS
+Thumbs.db
+.DS_Store

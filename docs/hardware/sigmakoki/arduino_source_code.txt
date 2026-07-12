@@ -1,0 +1,609 @@
+// ============================================
+// 三轴步进电机控制系统 - 最终版
+// 配合Python控制程序使用
+// ============================================
+
+// 电机控制引脚
+const int XPUL = 8;
+const int XDIR = 9;
+const int XLIM_POS = 4;
+const int XLIM_NEG = 5;
+
+const int YPUL = 10;
+const int YDIR = 11;
+const int YLIM_POS = 2;
+const int YLIM_NEG = 3;
+
+const int ZPUL = 12;
+const int ZDIR = 13;
+const int ZLIM_POS = 6;
+const int ZLIM_NEG = 7;
+
+// 系统参数
+int pulseDelay = 2;  // 脉冲延时（毫秒），影响速度
+bool verboseMode = false;  // 详细输出模式
+bool testMode = false;     // 测试模式
+
+// 位置跟踪
+long xPosition = 0;
+long yPosition = 0;
+long zPosition = 0;
+
+// 符号函数
+#define sgn(x) ((x) < 0 ? -1 : ((x) > 0 ? 1 : 0))
+
+void setup() {
+  // 设置引脚模式
+  pinMode(XPUL, OUTPUT);
+  pinMode(XDIR, OUTPUT);
+  pinMode(YPUL, OUTPUT);
+  pinMode(YDIR, OUTPUT);
+  pinMode(ZPUL, OUTPUT);
+  pinMode(ZDIR, OUTPUT);
+  
+  // 限位引脚使用INPUT模式（不启用内部上拉）
+  pinMode(XLIM_POS, INPUT);
+  pinMode(XLIM_NEG, INPUT);
+  pinMode(YLIM_POS, INPUT);
+  pinMode(YLIM_NEG, INPUT);
+  pinMode(ZLIM_POS, INPUT);
+  pinMode(ZLIM_NEG, INPUT);
+  
+  // 初始化电机引脚
+  digitalWrite(XPUL, LOW);
+  digitalWrite(XDIR, LOW);
+  digitalWrite(YPUL, LOW);
+  digitalWrite(YDIR, LOW);
+  digitalWrite(ZPUL, LOW);
+  digitalWrite(ZDIR, LOW);
+  
+  // 串口通信
+  Serial.begin(9600);
+  Serial.setTimeout(10);
+  
+  Serial.println("STEPPER_CONTROLLER_READY");
+  Serial.println("COMMAND_FORMAT: (X Y Z)");
+  Serial.println("EXAMPLE: (100 0 0)");
+  Serial.println("SPECIAL_COMMANDS: STATUS, TEST, HOME, SPEED=2, VERBOSE, LIMITS, CALIBRATE_XY");
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    
+    if (command.length() == 0) return;
+    
+    // ============================================
+    // 特殊命令处理
+    // ============================================
+    
+    // 显示系统状态
+    if (command == "STATUS") {
+      printStatus();
+      return;
+    }
+    
+    // 进入测试模式
+    if (command == "TEST") {
+      testMode = true;
+      Serial.println("TEST_MODE_ENABLED");
+      runTest();
+      testMode = false;
+      return;
+    }
+    
+    // 移动到原点（软件重置位置）
+    if (command == "HOME") {
+      xPosition = 0;
+      yPosition = 0;
+      zPosition = 0;
+      Serial.println("POSITION_RESET_TO_ZERO");
+      return;
+    }
+    
+    // 设置速度
+    if (command.startsWith("SPEED=")) {
+      int speedValue = command.substring(6).toInt();
+      if (speedValue >= 1 && speedValue <= 20) {
+        pulseDelay = speedValue;
+        Serial.print("SPEED_SET_TO:");
+        Serial.println(pulseDelay);
+      } else {
+        Serial.println("ERROR:SPEED_RANGE_1_20");
+      }
+      return;
+    }
+    
+    // 切换详细输出模式
+    if (command == "VERBOSE") {
+      verboseMode = !verboseMode;
+      Serial.print("VERBOSE_MODE:");
+      Serial.println(verboseMode ? "ON" : "OFF");
+      return;
+    }
+    
+    // 获取限位状态
+    if (command == "LIMITS") {
+      printLimits();
+      return;
+    }
+    
+    // XY轴自动校准和归零
+    if (command == "CALIBRATE_XY") {
+      calibrateXY();
+      return;
+    }
+    
+    // ============================================
+    // 移动命令处理 (格式: (X Y Z))
+    // ============================================
+    
+    // 检查是否是括号格式
+    if (command.startsWith("(") && command.endsWith(")")) {
+      // 去掉括号
+      String content = command.substring(1, command.length() - 1);
+      content.trim();
+      
+      // 解析三个数字
+      int firstSpace = content.indexOf(' ');
+      int secondSpace = content.indexOf(' ', firstSpace + 1);
+      
+      if (firstSpace != -1 && secondSpace != -1) {
+        int xSteps = content.substring(0, firstSpace).toInt();
+        int ySteps = content.substring(firstSpace + 1, secondSpace).toInt();
+        int zSteps = content.substring(secondSpace + 1).toInt();
+        
+        // 清空缓冲区
+        clearSerialBuffer();
+        
+        // 移动各轴
+        int xMoved = 0, yMoved = 0, zMoved = 0;
+        
+        if (xSteps != 0) {
+          xMoved = moveAxis('X', xSteps, XPUL, XDIR, XLIM_POS, XLIM_NEG);
+          xPosition += xMoved;
+        }
+        
+        if (ySteps != 0) {
+          yMoved = moveAxis('Y', ySteps, YPUL, YDIR, YLIM_POS, YLIM_NEG);
+          yPosition += yMoved;
+        }
+        
+        if (zSteps != 0) {
+          zMoved = moveAxis('Z', zSteps, ZPUL, ZDIR, ZLIM_POS, ZLIM_NEG);
+          zPosition += zMoved;
+        }
+        
+        // 返回移动结果
+        Serial.print("RESULT:");
+        Serial.print(xMoved);
+        Serial.print(",");
+        Serial.print(yMoved);
+        Serial.print(",");
+        Serial.println(zMoved);
+        
+        // 如果开启详细模式，打印更多信息
+        if (verboseMode) {
+          Serial.print("POSITION:");
+          Serial.print(xPosition);
+          Serial.print(",");
+          Serial.print(yPosition);
+          Serial.print(",");
+          Serial.println(zPosition);
+        }
+        
+        return;
+      } else {
+        Serial.println("ERROR:INVALID_FORMAT");
+        return;
+      }
+    }
+    
+    // ============================================
+    // 旧格式兼容 (无括号)
+    // ============================================
+    else {
+      int firstSpace = command.indexOf(' ');
+      int secondSpace = command.indexOf(' ', firstSpace + 1);
+      
+      if (firstSpace != -1 && secondSpace != -1) {
+        int xSteps = command.substring(0, firstSpace).toInt();
+        int ySteps = command.substring(firstSpace + 1, secondSpace).toInt();
+        int zSteps = command.substring(secondSpace + 1).toInt();
+        
+        // 清空缓冲区
+        clearSerialBuffer();
+        
+        // 移动各轴
+        int xMoved = 0, yMoved = 0, zMoved = 0;
+        
+        if (xSteps != 0) {
+          xMoved = moveAxis('X', xSteps, XPUL, XDIR, XLIM_POS, XLIM_NEG);
+          xPosition += xMoved;
+        }
+        
+        if (ySteps != 0) {
+          yMoved = moveAxis('Y', ySteps, YPUL, YDIR, YLIM_POS, YLIM_NEG);
+          yPosition += yMoved;
+        }
+        
+        if (zSteps != 0) {
+          zMoved = moveAxis('Z', zSteps, ZPUL, ZDIR, ZLIM_POS, ZLIM_NEG);
+          zPosition += zMoved;
+        }
+        
+        // 返回移动结果
+        Serial.print("RESULT:");
+        Serial.print(xMoved);
+        Serial.print(",");
+        Serial.print(yMoved);
+        Serial.print(",");
+        Serial.println(zMoved);
+        
+        if (verboseMode) {
+          Serial.print("POSITION:");
+          Serial.print(xPosition);
+          Serial.print(",");
+          Serial.print(yPosition);
+          Serial.print(",");
+          Serial.println(zPosition);
+        }
+        
+        return;
+      }
+    }
+    
+    // 未知命令
+    Serial.println("ERROR:UNKNOWN_COMMAND");
+  }
+}
+
+// ============================================
+// XY轴自动校准和归零
+// ============================================
+void calibrateXY() {
+  Serial.println("=== XY轴自动校准开始 ===");
+  
+  // 保存当前速度设置
+  int originalSpeed = pulseDelay;
+  pulseDelay = 2;  // 使用较快的速度进行校准
+  
+  // X轴校准
+  Serial.println("校准X轴...");
+  
+  // 先移动到负限位
+  Serial.println("寻找X负限位...");
+  long xNegPos = 0;
+  while (digitalRead(XLIM_NEG) == LOW) {
+    moveAxis('X', -500, XPUL, XDIR, XLIM_POS, XLIM_NEG);
+    xPosition -= 500;  // 手动更新位置
+  }
+  // 微调直到精确触发
+  while (digitalRead(XLIM_NEG) == HIGH) {
+    moveAxis('X', 10, XPUL, XDIR, XLIM_POS, XLIM_NEG);
+    xPosition += 10;
+  }
+  xNegPos = xPosition;
+  Serial.print("X负限位位置: ");
+  Serial.println(xNegPos);
+  
+  // 离开限位一点
+  moveAxis('X', 100, XPUL, XDIR, XLIM_POS, XLIM_NEG);
+  xPosition += 100;
+  delay(500);
+  
+  // 再移动到正限位
+  Serial.println("寻找X正限位...");
+  long xPosPos = 0;
+  while (digitalRead(XLIM_POS) == LOW) {
+    moveAxis('X', 500, XPUL, XDIR, XLIM_POS, XLIM_NEG);
+    xPosition += 500;
+  }
+  // 微调直到精确触发
+  while (digitalRead(XLIM_POS) == HIGH) {
+    moveAxis('X', -10, XPUL, XDIR, XLIM_POS, XLIM_NEG);
+    xPosition -= 10;
+  }
+  xPosPos = xPosition;
+  Serial.print("X正限位位置: ");
+  Serial.println(xPosPos);
+  
+  // 计算X轴中点
+  long xMiddle = (xNegPos + xPosPos) / 2;
+  Serial.print("X轴中点: ");
+  Serial.println(xMiddle);
+  
+  // 移动到X轴中点
+  long xMoveToMiddle = xMiddle - xPosition;
+  Serial.print("移动到X轴中点，需要移动: ");
+  Serial.println(xMoveToMiddle);
+  
+  int xMoved = moveAxis('X', xMoveToMiddle, XPUL, XDIR, XLIM_POS, XLIM_NEG);
+  xPosition += xMoved;
+  
+  // Y轴校准
+  Serial.println("校准Y轴...");
+  
+  // 先移动到负限位
+  Serial.println("寻找Y负限位...");
+  long yNegPos = 0;
+  while (digitalRead(YLIM_NEG) == LOW) {
+    moveAxis('Y', -500, YPUL, YDIR, YLIM_POS, YLIM_NEG);
+    yPosition -= 500;
+  }
+  // 微调直到精确触发
+  while (digitalRead(YLIM_NEG) == HIGH) {
+    moveAxis('Y', 10, YPUL, YDIR, YLIM_POS, YLIM_NEG);
+    yPosition += 10;
+  }
+  yNegPos = yPosition;
+  Serial.print("Y负限位位置: ");
+  Serial.println(yNegPos);
+  
+  // 离开限位一点
+  moveAxis('Y', 100, YPUL, YDIR, YLIM_POS, YLIM_NEG);
+  yPosition += 100;
+  delay(500);
+  
+  // 再移动到正限位
+  Serial.println("寻找Y正限位...");
+  long yPosPos = 0;
+  while (digitalRead(YLIM_POS) == LOW) {
+    moveAxis('Y', 500, YPUL, YDIR, YLIM_POS, YLIM_NEG);
+    yPosition += 500;
+  }
+  // 微调直到精确触发
+  while (digitalRead(YLIM_POS) == HIGH) {
+    moveAxis('Y', -10, YPUL, YDIR, YLIM_POS, YLIM_NEG);
+    yPosition -= 10;
+  }
+  yPosPos = yPosition;
+  Serial.print("Y正限位位置: ");
+  Serial.println(yPosPos);
+  
+  // 计算Y轴中点
+  long yMiddle = (yNegPos + yPosPos) / 2;
+  Serial.print("Y轴中点: ");
+  Serial.println(yMiddle);
+  
+  // 移动到Y轴中点
+  long yMoveToMiddle = yMiddle - yPosition;
+  Serial.print("移动到Y轴中点，需要移动: ");
+  Serial.println(yMoveToMiddle);
+  
+  int yMoved = moveAxis('Y', yMoveToMiddle, YPUL, YDIR, YLIM_POS, YLIM_NEG);
+  yPosition += yMoved;
+  
+  // 重置位置为0
+  xPosition = 0;
+  yPosition = 0;
+  
+  // 恢复原始速度
+  pulseDelay = originalSpeed;
+  
+  Serial.println("=== XY轴自动校准完成 ===");
+  Serial.println("XY轴已归零");
+  printStatus();
+}
+
+// ============================================
+// 移动单个轴（修改后的版本，Y轴和Z轴方向已反转）
+// ============================================
+int moveAxis(char axis, int steps, int pulPin, int dirPin, int limitPosPin, int limitNegPin) {
+  if (steps == 0) return 0;
+  
+  int actualSteps = 0;
+  
+  // 设置方向 - Y轴和Z轴方向逻辑反转
+  if (steps > 0) {
+    // 对于X轴保持原逻辑，Y轴和Z轴反转
+    if (axis == 'X') {
+      digitalWrite(dirPin, HIGH);
+    } else {
+      // Y轴和Z轴反转方向
+      digitalWrite(dirPin, LOW);
+    }
+  } else {
+    // 对于X轴保持原逻辑，Y轴和Z轴反转
+    if (axis == 'X') {
+      digitalWrite(dirPin, LOW);
+    } else {
+      // Y轴和Z轴反转方向
+      digitalWrite(dirPin, HIGH);
+    }
+  }
+  delayMicroseconds(10);
+  
+  // 检查限位（HIGH触发）
+  if (steps > 0 && digitalRead(limitPosPin) == HIGH) {
+    if (verboseMode || testMode) {
+      Serial.print(axis);
+      Serial.println("+LIMIT");
+    }
+    return 0;
+  }
+  
+  if (steps < 0 && digitalRead(limitNegPin) == HIGH) {
+    if (verboseMode || testMode) {
+      Serial.print(axis);
+      Serial.println("-LIMIT");
+    }
+    return 0;
+  }
+  
+  // 移动
+  int stepsToMove = abs(steps);
+  
+  for (int i = 0; i < stepsToMove; i++) {
+    // 移动中检查限位
+    if (steps > 0 && digitalRead(limitPosPin) == HIGH) {
+      if (verboseMode || testMode) {
+        Serial.print(axis);
+        Serial.println("+HIT");
+      }
+      break;
+    }
+    
+    if (steps < 0 && digitalRead(limitNegPin) == HIGH) {
+      if (verboseMode || testMode) {
+        Serial.print(axis);
+        Serial.println("-HIT");
+      }
+      break;
+    }
+    
+    // 生成脉冲
+    digitalWrite(pulPin, HIGH);
+    delay(pulseDelay);
+    digitalWrite(pulPin, LOW);
+    delay(pulseDelay);
+    
+    actualSteps++;
+  }
+  
+  return sgn(steps) * actualSteps;
+}
+
+// ============================================
+// 打印系统状态
+// ============================================
+void printStatus() {
+  Serial.println("=== SYSTEM STATUS ===");
+  
+  // 位置信息
+  Serial.print("POSITION: X=");
+  Serial.print(xPosition);
+  Serial.print(", Y=");
+  Serial.print(yPosition);
+  Serial.print(", Z=");
+  Serial.println(zPosition);
+  
+  // 限位状态
+  Serial.print("LIMITS: X+=");
+  Serial.print(digitalRead(XLIM_POS) == HIGH ? "TRIGGERED" : "NORMAL");
+  Serial.print(", X-=");
+  Serial.print(digitalRead(XLIM_NEG) == HIGH ? "TRIGGERED" : "NORMAL");
+  Serial.print(" | Y+=");
+  Serial.print(digitalRead(YLIM_POS) == HIGH ? "TRIGGERED" : "NORMAL");
+  Serial.print(", Y-=");
+  Serial.print(digitalRead(YLIM_NEG) == HIGH ? "TRIGGERED" : "NORMAL");
+  Serial.print(" | Z+=");
+  Serial.print(digitalRead(ZLIM_POS) == HIGH ? "TRIGGERED" : "NORMAL");
+  Serial.print(", Z-=");
+  Serial.println(digitalRead(ZLIM_NEG) == HIGH ? "TRIGGERED" : "NORMAL");
+  
+  // 系统设置
+  Serial.print("SPEED: ");
+  Serial.print(pulseDelay);
+  Serial.println("ms");
+  
+  Serial.print("VERBOSE: ");
+  Serial.println(verboseMode ? "ON" : "OFF");
+  
+  Serial.println("=====================");
+}
+
+// ============================================
+// 打印限位状态
+// ============================================
+void printLimits() {
+  Serial.println("LIMIT_STATUS:");
+  Serial.print("X+: ");
+  Serial.println(digitalRead(XLIM_POS));
+  Serial.print("X-: ");
+  Serial.println(digitalRead(XLIM_NEG));
+  Serial.print("Y+: ");
+  Serial.println(digitalRead(YLIM_POS));
+  Serial.print("Y-: ");
+  Serial.println(digitalRead(YLIM_NEG));
+  Serial.print("Z+: ");
+  Serial.println(digitalRead(ZLIM_POS));
+  Serial.print("Z-: ");
+  Serial.println(digitalRead(ZLIM_NEG));
+}
+
+// ============================================
+// 运行测试程序
+// ============================================
+void runTest() {
+  Serial.println("=== STARTING TEST ===");
+  
+  delay(1000);
+  
+  // 测试X轴
+  Serial.println("TEST_X_AXIS...");
+  testAxis('X', XPUL, XDIR, XLIM_POS, XLIM_NEG);
+  
+  delay(1000);
+  
+  // 测试Y轴
+  Serial.println("TEST_Y_AXIS...");
+  testAxis('Y', YPUL, YDIR, YLIM_POS, YLIM_NEG);
+  
+  delay(1000);
+  
+  // 测试Z轴
+  Serial.println("TEST_Z_AXIS...");
+  testAxis('Z', ZPUL, ZDIR, ZLIM_POS, ZLIM_NEG);
+  
+  Serial.println("=== TEST COMPLETED ===");
+}
+
+// ============================================
+// 测试单个轴
+// ============================================
+void testAxis(char axis, int pulPin, int dirPin, int limitPosPin, int limitNegPin) {
+  // 检查当前限位状态
+  int posState = digitalRead(limitPosPin);
+  int negState = digitalRead(limitNegPin);
+  
+  Serial.print(axis);
+  Serial.print("+限位: ");
+  Serial.print(posState);
+  Serial.print(" (");
+  Serial.print(posState == HIGH ? "触发" : "正常");
+  Serial.println(")");
+  
+  Serial.print(axis);
+  Serial.print("-限位: ");
+  Serial.print(negState);
+  Serial.print(" (");
+  Serial.print(negState == HIGH ? "触发" : "正常");
+  Serial.println(")");
+  
+  delay(500);
+  
+  // 测试正向移动（如果正限位未触发）
+  if (posState == LOW) {
+    Serial.print("正向移动50步...");
+    int moved = moveAxis(axis, 50, pulPin, dirPin, limitPosPin, limitNegPin);
+    Serial.print("移动了");
+    Serial.print(moved);
+    Serial.println("步");
+  } else {
+    Serial.println("正限位触发，跳过正向移动测试");
+  }
+  
+  delay(1000);
+  
+  // 测试负向移动（如果负限位未触发）
+  if (negState == LOW) {
+    Serial.print("负向移动50步...");
+    int moved = moveAxis(axis, -50, pulPin, dirPin, limitPosPin, limitNegPin);
+    Serial.print("移动了");
+    Serial.print(moved);
+    Serial.println("步");
+  } else {
+    Serial.println("负限位触发，跳过负向移动测试");
+  }
+}
+
+// ============================================
+// 清空串口缓冲区
+// ============================================
+void clearSerialBuffer() {
+  while (Serial.available() > 0) {
+    Serial.read();
+  }
+}

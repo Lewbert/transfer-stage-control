@@ -1,0 +1,24 @@
+# Goal: To build an app for 2D material transfer system
+
+The system is featured with 3 instruments to control: a SigmaKoki XYZ stage to move top sample, a Zolix XYR stage to move bottom sample, a Yudian temperature controller to control temperature of sample stage.
+
+The main function of this app is to control two stage (XYZ and XYR stage) together. These two stage should operate independently, under the control of same app.
+
+For the control of two stages, I propose to use both keyboard and xbox-compatible gamepad for controls.
+
+For keyboard control, WASD controls the SigmaKoki stage XY axis and direction keys controls Zolix stage XY axis, all single-click walks one step and long-press toggles continuous move. Shift + long press WASD or direction keys toggles fast movement (continuous move with faster speed). Additionally, Q and E control rotational movement, while U and J control Z axis up and down, all short press single step and long press continuous move.
+
+For gamepad control, The left stick controls the SigmaKoki stage, while the right stick controls Zolix XYR stage (only XY dimensions for these two stages). I propose to utilize the analog input of joysticks (map stick input to movement speed) so the user can control both the direction and the speed. In this case, left trigger toggles left fast movement, and right trigger toggles right fast movement. For the D-pad, it controls XY single-step movement (long press toggles slow-speed XY continuous move). Since there's only one D-pad on controller, i propose to use the back button to switch which stage D-pad controls. Also, the start button serve as a "disable/enable" button for the stage selected by back button. It is used to freeze the XYZ or XYR stage to avoid accidental false input in some scenarios.
+For XYAB buttons, XY controls rotation and AB controls Z axis, they shall work similarly as keyboard QE and UJ keys (short press and long press behaviors).
+
+Note that the "disable/enable selected stage" function is in software level. It do not disconnect the stage, just disables or enable all controls of that selected stage. E.g. when XYR stage disable, all XYR stage control commands shall not work, include keyboard and gampad controls.
+
+the Zolix XYR stage documents are in ./zolix_XYR_stage_doc. The SigmaKoki XYZ stage is a DIY stage uses arduino + stepper controller units to operate. Related documents and arduino example code are in ./sigmakoki_XYZ_stage_doc. You can take the arduino example code for reference (only about the pin definition, do not directly use control logic in that example) and write the arduino code .ino file on your own.
+
+Also, for both two stages you should handle it properly when one of the axes moved to its limit.
+
+The temperature controller documents and example code are in ./temp_control_doc. You can take the example code for reference to write the temp-control part. Be lightweight and we only need very basic functions (real-time temp readout, manually change target temp and choose & edit preset temp). We do not need functions like auto device scanning, which can be slow and buggy.
+
+For the interface of this app, you decide it on your own. It shall display the connection and working status of these 3 devices. There should also be a settings button to change settings (COM port dropbox selection for these devices, possible slave number and baudrate selections, configure slow-speed and fast-speed in steps per second for both stages, invert movement option for all axes.). For status display of these two stages it shall display current speed of axis, and if the axis reaches a limit. Buttons should also be available to click, work as the keyboard controls do (but only in slow mode for all XY controls, no slow or fast mode, only short and long press behaviors). The temperature controller panel should behave as I mentioned before (also with a connection status indicator). The whole app should also have an indicator to show the connection status of xbox-compatible gamepad. It should be able to support hot connection/disconnection of gamepad. For the connection of instruments, it shall attempts auto connect when app starts (or connection settings changed). Those settings and temperature presets should be stored locally (in a json file same as app path) so they can survive restarts.
+
+The overall app should be simple, lightweight and robust. Prefer using the conda virtual env when running the code. The app will be finally build up to a single .exe, so you may optimize for that purpose when writing code. You can create a new conda env for it, and make that a minimal env for better optimization.
