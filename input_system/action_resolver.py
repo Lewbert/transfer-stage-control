@@ -11,7 +11,8 @@ Handles:
 - Short press → single step (on release, if held < long_press_threshold)
 - Long press → continuous start (on threshold reached)
 - Release after continuous → continuous stop
-- Speed modifier (Shift / triggers)
+- Speed modifier (Shift / shoulder buttons LB+RB)
+- LT/RT triggers → focus motor continuous movement (gamma/deadzone mapping)
 - Software disable filtering
 - Keyboard priority over gamepad for same axis
 """
@@ -33,6 +34,38 @@ from input_system.input_mapping import (
     SPEED_MODIFIER_KEYS,
 )
 from input_system.gamepad_handler import GamepadState
+
+# Focus firmware floor (MIN_SPEED_SPS) — no setter on the firmware side,
+# enforced PC-side by the trigger mapping.
+FOCUS_FIRMWARE_MIN_SPS = 10
+
+
+def focus_trigger_to_speed(
+    lt: float, rt: float, *,
+    min_speed: float, max_speed: float,
+    gamma: float = 2.2, deadzone: float = 0.05, invert: bool = False,
+) -> int:
+    """Map analog triggers to a signed speed in steps/s (0 = stop).
+
+    net = RT − LT (both pressed cancels); ``invert`` negates net.
+    |net| <= deadzone → 0.  ``x`` is the deadzone-rescaled magnitude
+    0..1; speed rises continuously from ``min_speed`` at the deadzone
+    edge to ``max_speed`` at full deflection, shaped by ``gamma``.
+
+    Returns a signed int: +speed for RT net, −speed for LT net.
+    """
+    net = rt - lt
+    if invert:
+        net = -net
+    mag = abs(net)
+    if mag <= deadzone:
+        return 0
+    x = (mag - deadzone) / (1.0 - deadzone)
+    lo = max(FOCUS_FIRMWARE_MIN_SPS, float(min_speed))
+    hi = max(lo, float(max_speed))
+    speed = lo + (hi - lo) * (x ** float(gamma))
+    speed = min(speed, hi)  # guard rounding at x == 1
+    return int(round(speed)) if net > 0 else -int(round(speed))
 
 
 class ActionResolver:
@@ -75,9 +108,29 @@ class ActionResolver:
         zolix_slow_r: float = 500,
         zolix_fast_r: float = 2000,
         trigger_threshold: float = 0.5,
+        focus_min_speed: float = 50,
+        focus_max_speed: float = 2000,
+        focus_gamma: float = 2.2,
+        focus_deadzone: float = 0.05,
+        focus_invert: bool = False,
     ) -> None:
         self._long_press_s = long_press_threshold_s
+        # Vestigial since LB/RB replaced the triggers as the fast-mode
+        # modifier — kept for signature compatibility (see update_speeds).
         self._trigger_threshold = trigger_threshold
+
+        # Focus trigger mapping (LT/RT → continuous movement)
+        self._focus_min = focus_min_speed
+        self._focus_max = focus_max_speed
+        self._focus_gamma = focus_gamma
+        self._focus_deadzone = focus_deadzone
+        self._focus_invert = focus_invert
+        self._focus_active = False  # trigger currently commanding movement
+        self._focus_paused = False  # ESC latch — clears on trigger release
+
+        # ESC latch for re-emitting stick sources (8-dir) — a paused
+        # stick id stays suppressed until the stick returns to center.
+        self._stick_pause: Set[str] = set()
 
         # Speed tables
         self._slow_speed = {"sigmakoki": sigmakoki_slow_speed, "zolix": zolix_slow_speed}
@@ -89,7 +142,7 @@ class ActionResolver:
         self._fast_z = {"sigmakoki": sigmakoki_fast_z}
 
         # Per-stage enabled state (updated externally by InputManager)
-        self._enabled: Dict[str, bool] = {"sigmakoki": True, "zolix": True}
+        self._enabled: Dict[str, bool] = {"sigmakoki": True, "zolix": True, "focus": True}
 
         # Track which keyboard keys are in continuous mode
         # key = "stage_id:axis", value = keysym
@@ -124,15 +177,23 @@ class ActionResolver:
         key_state: Dict[str, float],
         gamepad: GamepadState,
         now: Optional[float] = None,
+        ui_state: Optional[Dict[str, tuple]] = None,
     ) -> List[StageCommand]:
-        """Resolve one frame of input state into a list of stage commands."""
+        """Resolve one frame of input state into a list of stage commands.
+
+        *ui_state* maps ``"stage:axis"`` → ``(press_time, direction)`` for
+        on-screen button holds (written by the GUI thread, read here).
+        """
         if now is None:
             now = time.perf_counter()
+        if ui_state is None:
+            ui_state = {}
 
         commands: List[StageCommand] = []
 
         # Track which axes are claimed by keyboard (for gamepad suppression)
         kb_claimed: Set[str] = set()  # "stage_id:axis"
+        ui_claimed: Set[str] = set()  # "stage_id:axis" held by UI buttons
 
         # ---- Keyboard ----
         shift_held = self._is_shift_held(key_state)
@@ -150,6 +211,26 @@ class ActionResolver:
 
             duration = now - press_time
             claim_key = f"{action.stage_id}:{action.axis}"
+
+            if action.stage_id == "focus":
+                # Focus has no single_step — start continuous IMMEDIATELY
+                # on press so short taps nudge; Shift = fast.
+                speed = self._focus_key_speed(fast=shift_held)
+                commands.append(StageCommand(
+                    stage_id=action.stage_id,
+                    axis=action.axis,
+                    mode="continuous_start",
+                    direction=action.direction,
+                    speed=speed,
+                    source="keyboard",
+                ))
+                if claim_key not in self._continuous_keys:
+                    self._continuous_keys[claim_key] = keysym
+                    self._continuous_speed[claim_key] = speed
+                elif speed != self._continuous_speed.get(claim_key, 0):
+                    self._continuous_speed[claim_key] = speed
+                kb_claimed.add(claim_key)
+                continue
 
             if duration >= self._long_press_s:
                 speed = self._get_speed(action.stage_id, action.axis, fast=shift_held)
@@ -177,14 +258,43 @@ class ActionResolver:
                     self._continuous_speed[claim_key] = speed
                 kb_claimed.add(claim_key)
 
+        # ---- On-screen UI buttons (long-press holds) ----
+        for claim_key, entry in ui_state.items():
+            press_time, direction = entry
+            if press_time <= 0 or direction == 0:
+                continue
+            stage_id, axis = claim_key.split(":", 1)
+            if not self._enabled.get(stage_id, True):
+                continue
+            if claim_key in kb_claimed:
+                continue  # keyboard has priority over UI
+            ui_key = f"ui:{claim_key}"
+            speed = self._get_speed(stage_id, axis, fast=shift_held)
+            commands.append(StageCommand(
+                stage_id=stage_id, axis=axis,
+                mode="continuous_start", direction=direction,
+                speed=speed, source="ui_button",
+            ))
+            self._continuous_keys[ui_key] = str(direction)
+            self._continuous_speed[ui_key] = speed
+            ui_claimed.add(claim_key)
+
+        # Combined claim set — suppresses all gamepad sources
+        claimed = kb_claimed | ui_claimed
+
         # ---- Gamepad: analog sticks ----
         if gamepad.connected:
-            self._handle_sticks(gamepad, kb_claimed, commands)
-            self._handle_dpad(gamepad, now, kb_claimed, commands)
-            self._handle_face_buttons(gamepad, now, commands)
+            self._handle_sticks(gamepad, claimed, commands)
+            self._handle_dpad(gamepad, now, claimed, commands)
+            self._handle_face_buttons(gamepad, now, claimed, commands)
+
+        # ---- Gamepad: focus triggers (always run — on disconnect the
+        # state is zeroed, so this emits the stop for a jog in progress)
+        self._handle_triggers(gamepad, claimed, commands)
 
         # ---- Stop continuous axes that are no longer commanded ----
-        self._handle_stops(key_state, gamepad, now, commands)
+        self._handle_stops(key_state, gamepad, now, commands,
+                           ui_state=ui_state, claimed=claimed)
 
         return commands
 
@@ -223,9 +333,20 @@ class ActionResolver:
 
             claim_key = f"{action.stage_id}:{action.axis}"
 
+            # Focus has no single_step — handled as continuous elsewhere
+            if action.stage_id == "focus":
+                continue
+
             # Only emit single-step if released before long-press threshold
             duration = now - prev_press_time
             if duration < self._long_press_s:
+                # Don't single-step into an axis that is in continuous
+                # motion, and apply the 0.2 s cooldown (same as dpad).
+                if self._axis_claimed(action.stage_id, action.axis):
+                    continue
+                if now - self._last_single_step_time.get(claim_key, 0) <= 0.2:
+                    continue
+                self._last_single_step_time[claim_key] = now
                 commands.append(StageCommand(
                     stage_id=action.stage_id,
                     axis=action.axis,
@@ -247,6 +368,21 @@ class ActionResolver:
                 return True
         return False
 
+    def _focus_key_speed(self, fast: bool) -> float:
+        """Keyboard focus speed: fast = focus max_speed;
+        slow = max(firmware floor, min_speed, max_speed // 4).
+        Defaults (min=50, max=2000) → slow 500, fast 2000 steps/s."""
+        if fast:
+            return float(self._focus_max)
+        return float(max(FOCUS_FIRMWARE_MIN_SPS, self._focus_min, self._focus_max // 4))
+
+    def _axis_claimed(self, stage_id: str, axis: str) -> bool:
+        """True if any source is currently driving the axis continuously."""
+        for key in self._continuous_keys:
+            if key == f"{stage_id}:{axis}" or key.endswith(f":{stage_id}:{axis}"):
+                return True
+        return f"{stage_id}:{axis}" in self._continuous_stick
+
     # ------------------------------------------------------------------
     # Gamepad: Analog Sticks
     # ------------------------------------------------------------------
@@ -254,7 +390,7 @@ class ActionResolver:
     def _handle_sticks(
         self,
         gamepad: GamepadState,
-        kb_claimed: Set[str],
+        claimed: Set[str],
         commands: List[StageCommand],
     ) -> None:
         """Map analog sticks — per-axis analog for Arduino, 8-dir for Zolix."""
@@ -265,26 +401,26 @@ class ActionResolver:
         # which is the sole source of hardware direction correction.
         # Use Settings → invert_x / invert_y / invert_z for per-axis reversal.
         if self._enabled.get("sigmakoki", True):
-            fast = gamepad.left_trigger >= self._trigger_threshold
+            fast = gamepad.button_left_shoulder
             max_spd = self._fast_speed["sigmakoki"] if fast else self._slow_speed["sigmakoki"]
-            self._stick_analog(gamepad.left_x, "sigmakoki", "x", max_spd, kb_claimed, commands)
-            self._stick_analog(gamepad.left_y, "sigmakoki", "y", max_spd, kb_claimed, commands)
+            self._stick_analog(gamepad.left_x, "sigmakoki", "x", max_spd, claimed, commands)
+            self._stick_analog(gamepad.left_y, "sigmakoki", "y", max_spd, claimed, commands)
 
         # Right stick → Zolix (8-direction)
         if self._enabled.get("zolix", True):
-            fast = gamepad.right_trigger >= self._trigger_threshold
+            fast = gamepad.button_right_shoulder
             self._stick_8dir(
                 gamepad.right_x, gamepad.right_y, "zolix", "right",
-                fast, kb_claimed, commands,
+                fast, claimed, commands,
             )
 
     def _stick_analog(
         self, value: float, stage_id: str, axis: str, max_speed: float,
-        kb_claimed: Set[str], commands: List[StageCommand],
+        claimed: Set[str], commands: List[StageCommand],
     ) -> None:
         """Per-axis analog stick — continuous speed, small 10% dead zone."""
         ck = f"{stage_id}:{axis}"
-        if ck in kb_claimed:
+        if ck in claimed:
             return
         if abs(value) < 0.10:
             if ck in self._continuous_stick:
@@ -304,11 +440,62 @@ class ActionResolver:
         ))
         self._continuous_stick[ck] = True
 
+    def _handle_triggers(
+        self,
+        gamepad: GamepadState,
+        claimed: Set[str],
+        commands: List[StageCommand],
+    ) -> None:
+        """Map LT/RT triggers to focus-motor continuous movement.
+
+        Re-emits ``continuous_start`` every frame while the triggers
+        command a nonzero speed (the driver rate-limits serial sends)
+        and emits exactly one ``continuous_stop`` on release.
+        """
+        if not self._enabled.get("focus", True):
+            return
+        if self._focus_paused:
+            # ESC latch — wait for the triggers to release before
+            # allowing re-engagement.
+            if focus_trigger_to_speed(
+                gamepad.left_trigger, gamepad.right_trigger,
+                min_speed=self._focus_min, max_speed=self._focus_max,
+                gamma=self._focus_gamma, deadzone=self._focus_deadzone,
+                invert=self._focus_invert,
+            ) == 0:
+                self._focus_paused = False
+            return
+        if "focus:z" in claimed:
+            # Keyboard focus keys own the axis — emit nothing here and
+            # don't touch _focus_active (keyboard stop branch handles it).
+            return
+        speed = focus_trigger_to_speed(
+            gamepad.left_trigger, gamepad.right_trigger,
+            min_speed=self._focus_min, max_speed=self._focus_max,
+            gamma=self._focus_gamma, deadzone=self._focus_deadzone,
+            invert=self._focus_invert,
+        )
+        if speed == 0:
+            if self._focus_active:
+                commands.append(StageCommand(
+                    stage_id="focus", axis="z",
+                    mode="continuous_stop", direction=0, speed=0,
+                    source="gamepad_trigger",
+                ))
+                self._focus_active = False
+            return
+        commands.append(StageCommand(
+            stage_id="focus", axis="z",
+            mode="continuous_start", direction=1 if speed > 0 else -1,
+            speed=float(abs(speed)), source="gamepad_trigger",
+        ))
+        self._focus_active = True
+
     def _stick_8dir(
         self, x: float, y: float,
         stage_id: str, stick_id: str,
         fast: bool,
-        kb_claimed: Set[str],
+        claimed: Set[str],
         commands: List[StageCommand],
     ) -> None:
         """8-direction stick: 50% dead zone, wide cardinals (60°), narrow diagonals (30°)."""
@@ -318,6 +505,7 @@ class ActionResolver:
 
         # 50% dead zone — stop only the axes that were actually moving
         if magnitude < 0.50:
+            self._stick_pause.discard(stick_id)  # ESC latch clears on re-center
             prev = self._last_stick_dir.pop(stick_id, -1)
             self._stick_dir_counter.pop(stick_id, None)  # reset hysteresis
             if prev >= 0:
@@ -332,6 +520,9 @@ class ActionResolver:
                     self._continuous_stick.pop(ck, None)
                 self._last_stick_fast.pop(stick_id, None)
             return
+
+        if stick_id in self._stick_pause:
+            return  # ESC latch — stick must re-center before re-engaging
 
         # Wide cardinals: abs(x) > 2*abs(y) → X only, abs(y) > 2*abs(x) → Y only
         # tan(63°) ≈ 2.0 — cardinals are ~63° wide, diagonals ~27°
@@ -352,17 +543,37 @@ class ActionResolver:
         prev_dir = self._last_stick_dir.get(stick_id, -1)
         prev_fast = self._last_stick_fast.get(stick_id, False)
 
+        # Direction stable — re-emit the committed axes every frame.
+        # The driver's fast path makes this zero serial I/O when nothing
+        # changed; if a real failure dropped the commit, the next frame
+        # retries and recovers after FAIL_BACKOFF.  Do NOT touch the
+        # hysteresis counter here (it only counts ticks toward a NEW
+        # direction — resetting it would re-enable the oscillation
+        # lock-out below).
+        if prev_dir == direction and prev_fast == fast:
+            for ax, dr in _DIR_MAP[direction]:
+                ck = f"{stage_id}:{ax}"
+                if ck in claimed:
+                    continue
+                commands.append(StageCommand(
+                    stage_id=stage_id, axis=ax,
+                    mode="continuous_start", direction=dr,
+                    speed=speed, source="gamepad_stick",
+                ))
+                self._continuous_stick[ck] = True
+            return
+
         # Hysteresis: require 2 consecutive ticks in a NEW direction before committing.
         # The counter is only incremented on direction change, never reset on match —
         # this prevents counter oscillation (1→0→1→0) from locking the axis in place
         # when stick noise alternates between two directions near a sector boundary.
-        if prev_dir == direction and prev_fast == fast:
-            return  # no change — direction is stable
-
         cnt = self._stick_dir_counter.get(stick_id, 0) + 1
         self._stick_dir_counter[stick_id] = cnt
-        if cnt < 2:
-            return  # not confirmed yet — wait one more tick
+        # Fast path: just exited dead zone (prev_dir == -1) — commit in 1 tick.
+        # Direction changes between cardinals still require 2 ticks for debounce.
+        threshold = 1 if prev_dir < 0 else 2
+        if cnt < threshold:
+            return  # not confirmed yet
 
         self._stick_dir_counter[stick_id] = 0
 
@@ -383,7 +594,7 @@ class ActionResolver:
 
         for ax, dr in _DIR_MAP[direction]:
             ck = f"{stage_id}:{ax}"
-            if ck in kb_claimed:
+            if ck in claimed:
                 continue
             commands.append(StageCommand(
                 stage_id=stage_id, axis=ax,
@@ -401,21 +612,21 @@ class ActionResolver:
         self,
         gamepad: GamepadState,
         now: float,
-        kb_claimed: Set[str],
+        claimed: Set[str],
         commands: List[StageCommand],
     ) -> None:
         """Map D-pad to XY movement with short/long-press detection.
 
-        Speed: slow by default, fast when the stage's trigger is held
-        (left trigger for SigmaKoki, right trigger for Zolix).
+        Speed: slow by default, fast when the stage's shoulder button
+        is held (LB for SigmaKoki, RB for Zolix).
         """
         stage_id = self._dpad_stage
         if not self._enabled.get(stage_id, True):
             return
 
-        # Trigger fast mode per stage
-        trigger = gamepad.left_trigger if stage_id == "sigmakoki" else gamepad.right_trigger
-        fast = trigger >= self._trigger_threshold
+        # Shoulder-button fast mode per stage
+        fast = (gamepad.button_left_shoulder if stage_id == "sigmakoki"
+                else gamepad.button_right_shoulder)
         dpad_speed = self._fast_speed[stage_id] if fast else self._slow_speed[stage_id]
 
         dpad_dirs = [
@@ -429,7 +640,10 @@ class ActionResolver:
             claim_key = f"{stage_id}:{axis}"
             press_key = f"dpad:{claim_key}:{direction}"
 
-            if claim_key in kb_claimed:
+            if claim_key in claimed:
+                # Higher-priority source owns this axis — suppress entirely;
+                # drop any press time so a release can't fire a single-step.
+                self._gamepad_press_times.pop(press_key, None)
                 continue
 
             if pressed:
@@ -474,24 +688,25 @@ class ActionResolver:
         self,
         gamepad: GamepadState,
         now: float,
+        claimed: Set[str],
         commands: List[StageCommand],
     ) -> None:
-        """Map X/Y/A/B with short/long-press + trigger fast mode."""
-        # X/Y → rotation (Zolix R) — right trigger for fast
+        """Map X/Y/A/B with short/long-press + shoulder-button fast mode."""
+        # X/Y → rotation (Zolix R) — RB for fast
         if self._enabled.get("zolix", True):
-            fast = gamepad.right_trigger >= self._trigger_threshold
+            fast = gamepad.button_right_shoulder
             speed = self._fast_r.get("zolix", 2000) if fast else self._slow_r.get("zolix", 500)
             for pressed, direction, btn_name in [
                 (gamepad.button_x, -1, "X"),
                 (gamepad.button_y, +1, "Y"),
             ]:
                 self._handle_single_gamepad_button(
-                    pressed, "zolix", "r", direction, btn_name, now, commands, speed,
+                    pressed, "zolix", "r", direction, btn_name, now, claimed, commands, speed,
                 )
 
-        # A/B → Z axis (SigmaKoki) — left trigger for fast
+        # A/B → Z axis (SigmaKoki) — LB for fast
         if self._enabled.get("sigmakoki", True):
-            fast = gamepad.left_trigger >= self._trigger_threshold
+            fast = gamepad.button_left_shoulder
             speed = self._fast_z.get("sigmakoki", 500) if fast else self._slow_z.get("sigmakoki", 200)
             # One-time diagnostic: log all configured speeds
             if not getattr(self, '_speed_diag_done', False):
@@ -505,7 +720,7 @@ class ActionResolver:
                 (gamepad.button_b, -1, "B"),
             ]:
                 self._handle_single_gamepad_button(
-                    pressed, "sigmakoki", "z", direction, btn_name, now, commands, speed,
+                    pressed, "sigmakoki", "z", direction, btn_name, now, claimed, commands, speed,
                 )
 
     def _handle_single_gamepad_button(
@@ -516,12 +731,20 @@ class ActionResolver:
         direction: int,
         btn_name: str,
         now: float,
+        claimed: Set[str],
         commands: List[StageCommand],
         speed: float = 200,
     ) -> None:
         """Handle short/long-press for a single gamepad button."""
         press_key = f"btn:{stage_id}:{axis}:{direction}"
         claim_key = f"btn:{stage_id}:{axis}"
+
+        if f"{stage_id}:{axis}" in claimed:
+            # Higher-priority source (keyboard/UI) owns this axis — suppress
+            # entirely; drop any press time so the release cannot fire a
+            # single-step either.
+            self._gamepad_press_times.pop(press_key, None)
+            return
 
         if pressed:
             if press_key not in self._gamepad_press_times:
@@ -562,24 +785,54 @@ class ActionResolver:
         gamepad: GamepadState,
         now: float,
         commands: List[StageCommand],
+        ui_state: Optional[Dict[str, tuple]] = None,
+        claimed: Optional[Set[str]] = None,
     ) -> None:
         """Emit continuous_stop for axes that are no longer commanded,
         and single_step for gamepad buttons released before threshold."""
+        if ui_state is None:
+            ui_state = {}
+        if claimed is None:
+            claimed = set()
 
         # ---- Keyboard stops ----
         for claim_key, keysym in list(self._continuous_keys.items()):
-            if claim_key.startswith("dpad:") or claim_key.startswith("btn:"):
+            if claim_key.startswith(("dpad:", "btn:", "ui:")):
                 continue
             if keysym in key_state and key_state[keysym] > 0:
                 continue
-            # Key released → stop
+            # Key released → stop (unless a UI button took over the axis)
             stage_id, axis = claim_key.split(":")
+            if ui_state.get(claim_key, (0.0, 0))[0] > 0:
+                del self._continuous_keys[claim_key]
+                self._continuous_speed.pop(claim_key, None)
+                continue  # UI still held — its branch re-emits this frame
             commands.append(StageCommand(
                 stage_id=stage_id, axis=axis,
                 mode="continuous_stop", direction=0, speed=0,
                 source="keyboard",
             ))
             del self._continuous_keys[claim_key]
+            self._continuous_speed.pop(claim_key, None)
+
+        # ---- UI-button stops ----
+        for claim_key in list(self._continuous_keys):
+            if not claim_key.startswith("ui:"):
+                continue
+            parts = claim_key.split(":")
+            stage_id, axis = parts[1], parts[2]
+            plain = f"{stage_id}:{axis}"
+            if ui_state.get(plain, (0.0, 0))[0] > 0:
+                continue  # still held
+            if plain not in claimed:
+                # Released and no higher-priority source took over
+                commands.append(StageCommand(
+                    stage_id=stage_id, axis=axis,
+                    mode="continuous_stop", direction=0, speed=0,
+                    source="ui_button",
+                ))
+            del self._continuous_keys[claim_key]
+            self._continuous_speed.pop(claim_key, None)
 
         # ---- D-pad stops (with single-step on short press) ----
         for press_key, press_time in list(self._gamepad_press_times.items()):
@@ -590,6 +843,7 @@ class ActionResolver:
             stage_id, axis, dir_str = parts[1], parts[2], parts[3]
             direction = int(dir_str)
             claim_key = f"dpad:{stage_id}:{axis}"
+            claimed_axis = f"{stage_id}:{axis}" in claimed
 
             # Check if still pressed
             still_pressed = self._is_dpad_direction_pressed(gamepad, axis, direction)
@@ -600,7 +854,8 @@ class ActionResolver:
             held_duration = now - press_time
             if held_duration < self._long_press_s:
                 # Short press → single step (200ms cooldown)
-                if self._enabled.get(stage_id, True) and now - self._last_single_step_time.get(f"{stage_id}:{axis}", 0) > 0.2:
+                if (self._enabled.get(stage_id, True) and not claimed_axis
+                        and now - self._last_single_step_time.get(f"{stage_id}:{axis}", 0) > 0.2):
                     self._last_single_step_time[f"{stage_id}:{axis}"] = now
                     commands.append(StageCommand(
                         stage_id=stage_id, axis=axis,
@@ -610,12 +865,14 @@ class ActionResolver:
                         source="gamepad_dpad",
                     ))
             elif claim_key in self._continuous_keys:
-                # Long press release → stop
-                commands.append(StageCommand(
-                    stage_id=stage_id, axis=axis,
-                    mode="continuous_stop", direction=0, speed=0,
-                    source="gamepad_dpad",
-                ))
+                # Long press release → stop (unless a keyboard/UI source
+                # took the axis over mid-hold)
+                if not claimed_axis:
+                    commands.append(StageCommand(
+                        stage_id=stage_id, axis=axis,
+                        mode="continuous_stop", direction=0, speed=0,
+                        source="gamepad_dpad",
+                    ))
                 del self._continuous_keys[claim_key]
                 self._continuous_speed.pop(claim_key, None)
 
@@ -629,6 +886,7 @@ class ActionResolver:
             stage_id, axis, dir_str = parts[1], parts[2], parts[3]
             direction = int(dir_str)
             claim_key = f"btn:{stage_id}:{axis}"
+            claimed_axis = f"{stage_id}:{axis}" in claimed
 
             # Check if any button for this axis is still pressed
             still_pressed = self._is_face_button_pressed(gamepad, stage_id, axis, direction)
@@ -638,7 +896,8 @@ class ActionResolver:
             held_duration = now - press_time
             if held_duration < self._long_press_s:
                 # Short press → single step (200ms cooldown)
-                if self._enabled.get(stage_id, True) and now - self._last_single_step_time.get(f"{stage_id}:{axis}", 0) > 0.2:
+                if (self._enabled.get(stage_id, True) and not claimed_axis
+                        and now - self._last_single_step_time.get(f"{stage_id}:{axis}", 0) > 0.2):
                     self._last_single_step_time[f"{stage_id}:{axis}"] = now
                     commands.append(StageCommand(
                         stage_id=stage_id, axis=axis,
@@ -648,18 +907,19 @@ class ActionResolver:
                         source="gamepad_button",
                     ))
             elif claim_key in self._continuous_keys:
-                commands.append(StageCommand(
-                    stage_id=stage_id, axis=axis,
-                    mode="continuous_stop", direction=0, speed=0,
-                    source="gamepad_button",
-                ))
+                if not claimed_axis:
+                    commands.append(StageCommand(
+                        stage_id=stage_id, axis=axis,
+                        mode="continuous_stop", direction=0, speed=0,
+                        source="gamepad_button",
+                    ))
                 del self._continuous_keys[claim_key]
                 self._continuous_speed.pop(claim_key, None)
 
             del self._gamepad_press_times[press_key]
 
             # Check if another direction button for this axis is still held
-            self._restore_other_direction(press_key, stage_id, axis, gamepad, now, commands)
+            self._restore_other_direction(press_key, stage_id, axis, gamepad, now, claimed, commands)
 
         # ---- Stick stops are handled inline in _stick_analog / _stick_8dir ----
 
@@ -693,9 +953,12 @@ class ActionResolver:
 
     def _restore_other_direction(
         self, released_press_key: str, stage_id: str, axis: str,
-        gamepad: GamepadState, now: float, commands: List[StageCommand],
+        gamepad: GamepadState, now: float, claimed: Set[str],
+        commands: List[StageCommand],
     ) -> None:
         """If another button for the same axis is still held, re-emit its command."""
+        if f"{stage_id}:{axis}" in claimed:
+            return  # a keyboard/UI source owns the axis now
         for press_key, press_time in self._gamepad_press_times.items():
             if press_key == released_press_key:
                 continue
@@ -710,11 +973,11 @@ class ActionResolver:
             claim_key = f"btn:{stage_id}:{axis}"
             if duration >= self._long_press_s:
                 if claim_key not in self._continuous_keys:
-                    # Determine fast from the correct trigger for this stage
+                    # Determine fast from the correct shoulder button
                     if stage_id == "sigmakoki":
-                        fast = gamepad.left_trigger >= self._trigger_threshold
+                        fast = gamepad.button_left_shoulder
                     else:
-                        fast = gamepad.right_trigger >= self._trigger_threshold
+                        fast = gamepad.button_right_shoulder
                     commands.append(StageCommand(
                         stage_id=stage_id, axis=axis,
                         mode="continuous_start",
@@ -739,6 +1002,21 @@ class ActionResolver:
     def update_enabled(self, enabled: Dict[str, bool]) -> None:
         """Update the per-stage enabled state."""
         self._enabled.update(enabled)
+
+    def update_focus_config(
+        self,
+        min_speed: float,
+        max_speed: float,
+        gamma: float,
+        deadzone: float,
+        invert: bool,
+    ) -> None:
+        """Update the focus trigger-mapping config at runtime."""
+        self._focus_min = min_speed
+        self._focus_max = max_speed
+        self._focus_gamma = gamma
+        self._focus_deadzone = deadzone
+        self._focus_invert = invert
 
     def update_speeds(
         self,
@@ -771,20 +1049,46 @@ class ActionResolver:
 
     @dpad_stage.setter
     def dpad_stage(self, value: str) -> None:
-        """Set which stage the D-pad controls (called by InputManager on Back press)."""
-        # Stop any active D-pad continuous movement on state change
-        old_stage = self._dpad_stage
-        if value != old_stage:
-            for key in list(self._continuous_keys):
-                if key.startswith("dpad:"):
-                    del self._continuous_keys[key]
-            for key in list(self._gamepad_press_times):
-                if key.startswith("dpad:"):
-                    del self._gamepad_press_times[key]
-            for key in list(self._continuous_speed):
-                if key.startswith("dpad:"):
-                    del self._continuous_speed[key]
+        """Set which stage the D-pad controls.  Cleanup is the caller's job
+        — InputManager calls ``pop_dpad_stops()`` BEFORE switching so the
+        old stage's axes actually stop."""
         self._dpad_stage = value
+
+    def pop_dpad_stops(self) -> List[StageCommand]:
+        """Return continuous_stop commands for active dpad claims and clear
+        all dpad tracking (claims, press times, speed cache)."""
+        stops: List[StageCommand] = []
+        for key in list(self._continuous_keys):
+            if not key.startswith("dpad:"):
+                continue
+            _, stage_id, axis = key.split(":")
+            stops.append(StageCommand(
+                stage_id=stage_id, axis=axis,
+                mode="continuous_stop", direction=0, speed=0,
+                source="gamepad_dpad",
+            ))
+            del self._continuous_keys[key]
+        for tracking in (self._gamepad_press_times, self._continuous_speed):
+            for key in list(tracking):
+                if key.startswith("dpad:"):
+                    del tracking[key]
+        return stops
+
+    def cancel_all_continuous(self) -> None:
+        """Escape / STOP ALL: drop every continuous claim and latch the
+        re-emitting sources (8-dir sticks, focus triggers) until their
+        input returns to neutral, so a still-held input cannot instantly
+        restart an axis after an emergency stop."""
+        self._continuous_keys.clear()
+        self._continuous_speed.clear()
+        self._continuous_stick.clear()
+        self._gamepad_press_times.clear()
+        self._stick_pause.update(self._last_stick_dir.keys())
+        self._last_stick_dir.clear()
+        self._last_stick_fast.clear()
+        self._stick_dir_counter.clear()
+        self._focus_paused = True
+        self._focus_active = False
 
     @property
     def continuous_keys(self) -> Dict[str, str]:

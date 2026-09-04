@@ -10,10 +10,14 @@ queue drain loops, and the application lifecycle (connect → poll → run).
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
+
+from utils.paths import get_app_dir
 
 from utils.config import load_settings, save_settings
 from stage_control.instruments import InstrumentManager
@@ -83,7 +87,13 @@ class MainWindow:
             sigmakoki_config=self._settings.get("sigmakoki", {}),
             zolix_config=self._settings.get("zolix", {}),
             yudian_config=self._settings.get("yudian", {}),
+            focus_config=self._settings.get("focus", {}),
         )
+
+        # On-screen button hold state (written by the GUI thread, read by
+        # the input loop): "stage:axis" → (press_time, direction)
+        self._ui_state: Dict = {}
+        self._ui_lock = threading.Lock()
 
         # Build UI
         self._build_ui()
@@ -116,7 +126,13 @@ class MainWindow:
             loop_rate_hz=input_cfg.get("loop_rate_hz", 60),
             status_poll_rate_hz=input_cfg.get("status_poll_rate_hz", 10),
             trigger_threshold=gamepad_cfg.get("trigger_threshold", 0.5),
+            ui_state_provider=self._get_ui_state,
         )
+
+        # Safety: a mouse release anywhere clears UI button holds
+        # (widget-level ButtonRelease never fires when the pointer is
+        # released outside the button).
+        self.root.bind("<ButtonRelease-1>", lambda e: self._on_any_ui_release())
 
         # Start input loop
         self._input_manager.start()
@@ -142,7 +158,11 @@ class MainWindow:
     def _build_ui(self) -> None:
         """Build the three-column layout."""
         # Status bar
-        self._status_panel = StatusPanel(self.root, on_settings=self._on_settings)
+        self._status_panel = StatusPanel(
+            self.root,
+            on_settings=self._on_settings,
+            on_app_data=self._on_open_app_data,
+        )
         self._status_panel.pack(fill=tk.X, padx=4, pady=(4, 0))
 
         # Gamepad indicator
@@ -174,7 +194,7 @@ class MainWindow:
             on_enable_toggle=self._on_enable_toggle,
             on_button_press=self._on_ui_button_press,
             on_button_release=self._on_ui_button_release,
-            on_stop=lambda sid: self._instruments.stop_all_stages(),
+            on_stop=self._on_stop_all,
             on_zero=lambda sid: self._send_zero(sid),
             step_um={"x": (sk_um_xy, "µm"), "y": (sk_um_xy, "µm"), "z": (sk_um_z, "µm")},
         )
@@ -189,7 +209,7 @@ class MainWindow:
             on_enable_toggle=self._on_enable_toggle,
             on_button_press=self._on_ui_button_press,
             on_button_release=self._on_ui_button_release,
-            on_stop=lambda sid: self._instruments.stop_all_stages(),
+            on_stop=self._on_stop_all,
             on_zero=lambda sid: self._send_zero(sid),
             step_um={"x": (zx_um_xy, "µm"), "y": (zx_um_xy, "µm"), "r": (zx_um_r, "°")},
         )
@@ -216,8 +236,12 @@ class MainWindow:
             except queue.Empty:
                 break
             if isinstance(item, StageState):
-                panel = self._sk_panel if item.stage_id == "sigmakoki" else self._zx_panel
-                panel.update_state(item)
+                # Only the two stage panels consume states — focus has no
+                # panel (its poll keeps the firmware watchdog alive only).
+                if item.stage_id == "sigmakoki":
+                    self._sk_panel.update_state(item)
+                elif item.stage_id == "zolix":
+                    self._zx_panel.update_state(item)
         self.root.after(30, self._drain_gui_queue)
 
     def _drain_gamepad_queue(self) -> None:
@@ -249,6 +273,8 @@ class MainWindow:
                 self._status_panel.set_device_status("sigmakoki", connected)
             elif dev == "zolix":
                 self._status_panel.set_device_status("zolix", connected)
+            elif dev == "focus":
+                self._status_panel.set_device_status("focus", connected)
             elif dev == "yudian":
                 self._status_panel.set_device_status("yudian", connected)
                 if connected:
@@ -410,6 +436,7 @@ class MainWindow:
             connect_sigmakoki=bool(self._settings.get("sigmakoki", {}).get("port")),
             connect_zolix=bool(self._settings.get("zolix", {}).get("port")),
             connect_yudian=bool(self._settings.get("yudian", {}).get("port")),
+            connect_focus=bool(self._settings.get("focus", {}).get("port")),
         )
 
     # ------------------------------------------------------------------
@@ -422,46 +449,80 @@ class MainWindow:
         self._input_manager.update_enabled({
             "sigmakoki": self._instruments.is_enabled("sigmakoki"),
             "zolix": self._instruments.is_enabled("zolix"),
+            "focus": self._instruments.is_enabled("focus"),
         })
 
+    def _get_ui_state(self) -> Dict:
+        """Snapshot the on-screen button hold state (input-loop thread)."""
+        with self._ui_lock:
+            return dict(self._ui_state)
+
     def _on_ui_button_press(self, stage_id: str, axis: str, direction: int, single_step: bool) -> None:
-        """On-screen button press — uses per-axis speed."""
-        instruments = self._instruments
-        if stage_id == "sigmakoki":
-            if axis == "z":
-                speed = instruments.sigmakoki_slow_z
-            else:
-                speed = instruments.sigmakoki_slow_speed
-        else:  # zolix
-            if axis == "r":
-                speed = instruments.zolix_slow_r
-            else:
-                speed = instruments.zolix_slow_speed
-        cmd = StageCommand(
-            stage_id=stage_id,
-            axis=axis,
-            mode="single_step" if single_step else "continuous_start",
-            direction=direction,
-            speed=speed,
-            source="ui_button",
-        )
-        self._instruments.execute(cmd)
+        """On-screen button press.  Single-step clicks execute directly;
+        long-press holds are recorded for resolver-driven continuous
+        emission (Shift-aware speed, per-frame re-emission, claim-aware
+        stops)."""
+        if single_step:
+            instruments = self._instruments
+            if stage_id == "sigmakoki":
+                speed = instruments.sigmakoki_slow_z if axis == "z" else instruments.sigmakoki_slow_speed
+            else:  # zolix
+                speed = instruments.zolix_slow_r if axis == "r" else instruments.zolix_slow_speed
+            cmd = StageCommand(
+                stage_id=stage_id,
+                axis=axis,
+                mode="single_step",
+                direction=direction,
+                speed=speed,
+                source="ui_button",
+            )
+            self._instruments.execute(cmd)
+            return
+        # Long-press hold (the 300 ms timer fired) — the resolver emits
+        # continuous_start from here on (Shift = fast, re-emitted per frame).
+        with self._ui_lock:
+            self._ui_state[f"{stage_id}:{axis}"] = (time.perf_counter(), direction)
 
     def _on_ui_button_release(self, stage_id: str, axis: str) -> None:
-        """On-screen button release — stop continuous."""
-        cmd = StageCommand(
-            stage_id=stage_id,
-            axis=axis,
-            mode="continuous_stop",
-            direction=0,
-            speed=0,
-            source="ui_button",
-        )
-        self._instruments.execute(cmd)
+        """On-screen button release — clear the hold; the resolver emits
+        the continuous_stop on the next frame."""
+        with self._ui_lock:
+            self._ui_state[f"{stage_id}:{axis}"] = (0.0, 0)
+
+    def _on_any_ui_release(self) -> None:
+        """Mouse released anywhere — clear UI holds and button timers
+        (covers releases outside the pressed button)."""
+        with self._ui_lock:
+            for key in self._ui_state:
+                self._ui_state[key] = (0.0, 0)
+        try:
+            self._sk_panel.cancel_button_presses()
+            self._zx_panel.cancel_button_presses()
+        except Exception:
+            pass
+
+    def _on_stop_all(self, stage_id: str = None) -> None:
+        """STOP button — emergency stop all, latch continuous inputs."""
+        self._instruments.stop_all_stages()
+        try:
+            self._input_manager.cancel_continuous()
+        except Exception:
+            pass
+        with self._ui_lock:
+            for key in self._ui_state:
+                self._ui_state[key] = (0.0, 0)
+        logger.info("STOP ALL triggered (panel)")
 
     def _on_escape(self) -> None:
-        """Escape key — emergency stop all."""
+        """Escape key — emergency stop all, latch continuous inputs."""
         self._instruments.stop_all_stages()
+        try:
+            self._input_manager.cancel_continuous()
+        except Exception:
+            pass
+        with self._ui_lock:
+            for key in self._ui_state:
+                self._ui_state[key] = (0.0, 0)
         logger.info("ESCAPE: STOP ALL triggered")
 
     def _send_zero(self, stage_id: str) -> None:
@@ -475,6 +536,10 @@ class MainWindow:
         except Exception as exc:
             logger.warning("Zero failed for %s: %s", stage_id, exc)
 
+    def _on_open_app_data(self) -> None:
+        """Open the application data folder in Windows Explorer."""
+        os.startfile(get_app_dir())
+
     def _on_settings(self) -> None:
         """Open the settings dialog."""
         dlg = SettingsDialog(self.root, self._settings)
@@ -482,7 +547,7 @@ class MainWindow:
         if dlg.result is not None:
             # Check if any port changed BEFORE merging (for reconnect decision)
             port_changed = False
-            for section in ("sigmakoki", "zolix", "yudian"):
+            for section in ("sigmakoki", "zolix", "yudian", "focus"):
                 if section in dlg.result and "port" in dlg.result[section]:
                     old_port = self._settings.get(section, {}).get("port", "")
                     new_port = dlg.result[section]["port"]
@@ -502,6 +567,7 @@ class MainWindow:
             self._instruments.update_configs(
                 sigmakoki_config=self._settings.get("sigmakoki", {}),
                 zolix_config=self._settings.get("zolix", {}),
+                focus_config=self._settings.get("focus", {}),
             )
 
             # Update temperature safety limits

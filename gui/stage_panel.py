@@ -195,6 +195,11 @@ class StagePanel(ttk.LabelFrame):
         if self._on_button_press:
             self._on_button_press(self._stage_id, axis, direction, single_step=True)
 
+    def cancel_button_presses(self) -> None:
+        """Cancel pending long-press timers (mouse released off-button)."""
+        if self._buttons is not None:
+            self._buttons.cancel_all_presses()
+
     # ------------------------------------------------------------------
     # Update from StageState
     # ------------------------------------------------------------------

@@ -22,6 +22,7 @@ from typing import Any, Dict, Optional
 from stage_control.stage_state import StageCommand, StageState
 from stage_control.hardware.sigmakoki import SigmaKokiDriver, SPEED_LEVEL_TO_HZ
 from stage_control.hardware.zolix import ZolixDriver
+from stage_control.hardware.focus import FocusDriver
 from stage_control.hardware.yudian import (
     YudianController,
     YudianCommunicationError,
@@ -49,7 +50,9 @@ class InstrumentManager:
         sigmakoki_config: Dict[str, Any],
         zolix_config: Dict[str, Any],
         yudian_config: Dict[str, Any],
+        focus_config: Optional[Dict[str, Any]] = None,
     ) -> None:
+        focus_config = focus_config or {}
         # Drivers
         self.sigmakoki = SigmaKokiDriver(
             port=sigmakoki_config.get("port", ""),
@@ -60,14 +63,21 @@ class InstrumentManager:
             port=zolix_config.get("port", ""),
             slave_address=zolix_config.get("slave_address", 1),
             baudrate=zolix_config.get("baudrate", 115200),
-            timeout=zolix_config.get("timeout_s", 0.05),
+            timeout=zolix_config.get("timeout_s", 0.2),
             stop_mode=zolix_config.get("stop_mode", "immediate"),
+            verbose_logging=zolix_config.get("verbose_logging", False),
         )
         self.yudian = YudianController(
             port=yudian_config.get("port", ""),
             slave_address=yudian_config.get("slave_address", 1),
             baudrate=yudian_config.get("baudrate", 9600),
             timeout=yudian_config.get("timeout_s", 0.5),
+        )
+        self.focus = FocusDriver(
+            port=focus_config.get("port", ""),
+            baudrate=focus_config.get("baudrate", 115200),
+            timeout=focus_config.get("timeout_s", 0.5),
+            max_speed=focus_config.get("max_speed", 2000),
         )
 
         # Config for speed reference
@@ -99,14 +109,21 @@ class InstrumentManager:
         self._zolix_step_r = zolix_config.get("single_step_r",
             zolix_config.get("single_step_amount", 100))
 
+        self._focus_min = focus_config.get("min_speed", 50)
+        self._focus_max = focus_config.get("max_speed", 2000)
+        self._focus_gamma = focus_config.get("gamma", 2.2)
+        self._focus_deadzone = focus_config.get("deadzone", 0.05)
+        self._focus_invert = focus_config.get("invert", False)
+
         # Software enable/disable per stage
-        self._enabled: Dict[str, bool] = {"sigmakoki": True, "zolix": True}
+        self._enabled: Dict[str, bool] = {"sigmakoki": True, "zolix": True, "focus": True}
 
         # Per-axis "currently in continuous move" tracking
         # (for auto-stop when key is released)
         self._continuous_active: Dict[str, Dict[str, bool]] = {
             "sigmakoki": {"x": False, "y": False, "z": False},
             "zolix": {"x": False, "y": False, "r": False},
+            "focus": {"z": False},
         }
 
         # Connection state tracking
@@ -123,11 +140,12 @@ class InstrumentManager:
         connect_sigmakoki: bool = True,
         connect_zolix: bool = True,
         connect_yudian: bool = True,
+        connect_focus: bool = True,
     ) -> None:
         """Connect to all configured devices in background threads.
 
         Each successful/failed connection posts a status dict to *status_queue*:
-        ``{"device": "sigmakoki"|"zolix"|"yudian", "connected": bool, "error": str|None}``
+        ``{"device": "sigmakoki"|"zolix"|"yudian"|"focus", "connected": bool, "error": str|None}``
         """
         if self._connecting.is_set():
             return
@@ -182,6 +200,17 @@ class InstrumentManager:
             threads.append(t)
             t.start()
 
+        if connect_focus:
+            threads_started += 1
+            t = threading.Thread(
+                target=_connect_one,
+                args=("focus", self.focus, self.focus.connect),
+                daemon=True,
+                name="connect_focus",
+            )
+            threads.append(t)
+            t.start()
+
         if threads_started == 0:
             self._connecting.clear()
 
@@ -195,12 +224,12 @@ class InstrumentManager:
 
     def disconnect_all(self) -> None:
         """Disconnect all devices, stopping all motion first."""
-        for driver in [self.sigmakoki, self.zolix]:
+        for driver in [self.sigmakoki, self.zolix, self.focus]:
             try:
                 driver.stop_all()
             except Exception:
                 pass
-        for driver in [self.sigmakoki, self.zolix, self.yudian]:
+        for driver in [self.sigmakoki, self.zolix, self.yudian, self.focus]:
             try:
                 driver.disconnect()
             except Exception:
@@ -213,69 +242,84 @@ class InstrumentManager:
     def execute(self, command: StageCommand) -> bool:
         """Dispatch a single StageCommand to the appropriate driver.
 
+        Exceptions are caught per-command so a single failure never drops
+        the remaining commands in the current frame.
+
         Returns
         -------
         bool
             ``True`` if the command was dispatched, ``False`` if it was
             dropped (stage disabled, not connected, at limit, etc.).
         """
-        stage_id = command.stage_id
-        axis = command.axis
+        try:
+            stage_id = command.stage_id
+            axis = command.axis
 
-        # Software enable check
-        if not self._enabled.get(stage_id, True):
-            return False
+            # Software enable check
+            if not self._enabled.get(stage_id, True):
+                return False
 
-        # Get the right driver
-        driver = self._get_driver(stage_id)
-        if driver is None or not driver.is_connected:
-            return False
+            # Get the right driver
+            driver = self._get_driver(stage_id)
+            if driver is None or not driver.is_connected:
+                return False
 
-        # Apply flip XY if configured (swap X ↔ Y axis before inversion)
-        flip_xy = self._sigmakoki_flip_xy if stage_id == "sigmakoki" else self._zolix_flip_xy
-        if flip_xy and axis in ("x", "y"):
-            axis = "y" if axis == "x" else "x"
-
-        # Apply inversion if configured
-        direction = command.direction
-        invert_map = self._sigmakoki_invert if stage_id == "sigmakoki" else self._zolix_invert
-        if invert_map.get(axis, False):
-            direction = -direction
-
-        # Dispatch by mode
-        if command.mode == "continuous_start":
-            speed = command.speed
-            success = driver.continuous_start(axis, direction, speed)
-            if success:
-                self._continuous_active[stage_id][axis] = True
-            else:
-                logger.debug("%s %s: continuous_start rejected", stage_id, axis)
-            return success
-
-        elif command.mode == "continuous_stop":
-            # Always dispatch stop — tracking state may be stale
-            driver.continuous_stop(axis)
-            self._continuous_active[stage_id][axis] = False
-            return True
-
-        elif command.mode == "single_step":
+            # Apply flip XY if configured (swap X ↔ Y axis before inversion).
+            # Focus has no flip/invert here — its direction inversion lives
+            # in the trigger mapping (action_resolver).
             if stage_id == "sigmakoki":
-                step_amount = self._sigmakoki_step_z if axis == "z" else self._sigmakoki_step
+                flip_xy = self._sigmakoki_flip_xy
+                invert_map = self._sigmakoki_invert
+            elif stage_id == "zolix":
+                flip_xy = self._zolix_flip_xy
+                invert_map = self._zolix_invert
             else:
-                step_amount = self._zolix_step_r if axis == "r" else self._zolix_step
-            result = driver.single_step(axis, direction, step_amount)
-            return result != 0
+                flip_xy = False
+                invert_map = {}
+            if flip_xy and axis in ("x", "y"):
+                axis = "y" if axis == "x" else "x"
 
-        return False
+            # Apply inversion if configured
+            direction = command.direction
+            if invert_map.get(axis, False):
+                direction = -direction
+
+            # Dispatch by mode
+            if command.mode == "continuous_start":
+                speed = command.speed
+                success = driver.continuous_start(axis, direction, speed)
+                if success:
+                    self._continuous_active[stage_id][axis] = True
+                else:
+                    logger.debug("%s %s: continuous_start rejected", stage_id, axis)
+                return success
+
+            elif command.mode == "continuous_stop":
+                driver.continuous_stop(axis)
+                self._continuous_active[stage_id][axis] = False
+                return True
+
+            elif command.mode == "single_step":
+                if stage_id == "sigmakoki":
+                    step_amount = self._sigmakoki_step_z if axis == "z" else self._sigmakoki_step
+                else:
+                    step_amount = self._zolix_step_r if axis == "r" else self._zolix_step
+                result = driver.single_step(axis, direction, step_amount)
+                return result != 0
+
+            return False
+        except Exception:
+            logger.warning("Command dispatch failed: %s", command, exc_info=True)
+            return False
 
     def stop_all_stages(self) -> None:
         """Emergency stop ALL axes on both stages."""
-        for driver in [self.sigmakoki, self.zolix]:
+        for driver in [self.sigmakoki, self.zolix, self.focus]:
             try:
                 driver.stop_all()
             except Exception:
                 pass
-        for stage in ("sigmakoki", "zolix"):
+        for stage in ("sigmakoki", "zolix", "focus"):
             for axis in self._continuous_active[stage]:
                 self._continuous_active[stage][axis] = False
 
@@ -314,17 +358,21 @@ class InstrumentManager:
     # ------------------------------------------------------------------
 
     def poll_stage_status(self) -> Dict[str, StageState]:
-        """Poll both stages for current status.
+        """Poll all stages for current status.
 
-        Called from the input loop at ~5 Hz.
+        Called from the input loop at ~2 Hz.
 
         Returns
         -------
         dict
-            ``{"sigmakoki": StageState, "zolix": StageState}``
+            ``{"sigmakoki": StageState, "zolix": StageState, "focus": StageState}``
         """
         results = {}
-        for stage_id, driver in [("sigmakoki", self.sigmakoki), ("zolix", self.zolix)]:
+        for stage_id, driver in [
+            ("sigmakoki", self.sigmakoki),
+            ("zolix", self.zolix),
+            ("focus", self.focus),
+        ]:
             state = StageState(stage_id=stage_id)
             state.enabled = self._enabled.get(stage_id, True)
             state.connected = driver.is_connected
@@ -333,9 +381,13 @@ class InstrumentManager:
                 try:
                     if stage_id == "sigmakoki":
                         self._poll_sigmakoki(driver, state)
+                    elif stage_id == "focus":
+                        # Polled unconditionally: also serves as the
+                        # firmware serial-inactivity watchdog (TMO).
+                        self._poll_focus(driver, state)
                     else:
                         # Only poll Zolix when idle for 2+ seconds
-                        if time.time() - driver.last_command_time >= 2.0:
+                        if time.time() - driver.last_command_time >= 1.0:
                             self._poll_zolix(driver, state)
                             # Cache last known good state
                             self._zolix_last_state = state
@@ -385,6 +437,8 @@ class InstrumentManager:
             return self.sigmakoki
         elif stage_id == "zolix":
             return self.zolix
+        elif stage_id == "focus":
+            return self.focus
         return None
 
     def _poll_sigmakoki(self, driver: SigmaKokiDriver, state: StageState) -> None:
@@ -455,10 +509,26 @@ class InstrumentManager:
         except Exception as exc:
             logger.debug("Zolix poll error: %s", exc)
 
+    def _poll_focus(self, driver: FocusDriver, state: StageState) -> None:
+        """Fill StageState from the focus driver (no GUI panel — the
+        poll keeps the firmware TMO watchdog alive and refreshes the
+        driver's mode cache)."""
+        try:
+            status = driver.get_status()
+            state.position["z"] = status.get("position", 0)
+            state.current_speed["z"] = status.get("velocity", 0)
+            state.moving["z"] = self._continuous_active["focus"]["z"]
+            lim = status.get("limit", 0)
+            state.limits["z+"] = lim > 0
+            state.limits["z-"] = lim < 0
+        except Exception as exc:
+            logger.debug("Focus poll error: %s", exc)
+
     def update_configs(
         self,
         sigmakoki_config: Dict[str, Any],
         zolix_config: Dict[str, Any],
+        focus_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Update cached config values (called after settings change)."""
         self._sigmakoki_slow = sigmakoki_config.get("slow_speed_hz", 200)
@@ -488,6 +558,27 @@ class InstrumentManager:
         self._zolix_step = zolix_config.get("single_step_amount", 100)
         self._zolix_step_r = zolix_config.get("single_step_r",
             zolix_config.get("single_step_amount", 100))
+
+        self.zolix.set_verbose(bool(zolix_config.get("verbose_logging", False)))
+
+        if focus_config is not None:
+            new_max = focus_config.get("max_speed", 2000)
+            max_changed = new_max != self._focus_max
+            self._focus_min = focus_config.get("min_speed", 50)
+            self._focus_max = new_max
+            self._focus_gamma = focus_config.get("gamma", 2.2)
+            self._focus_deadzone = focus_config.get("deadzone", 0.05)
+            self._focus_invert = bool(focus_config.get("invert", False))
+            if max_changed and self.focus.is_connected:
+                # CFG:MAX is serial I/O — apply off the GUI thread
+                def _apply_max():
+                    try:
+                        self.focus.set_max_speed(new_max)
+                    except Exception as exc:
+                        logger.warning("Focus CFG:MAX apply failed: %s", exc)
+
+                threading.Thread(target=_apply_max, daemon=True,
+                                 name="focus_apply_max").start()
 
     @property
     def sigmakoki_slow_speed(self) -> float:
@@ -520,4 +611,24 @@ class InstrumentManager:
     @property
     def zolix_fast_r(self) -> float:
         return self._zolix_fast_r
+
+    @property
+    def focus_min_speed(self) -> float:
+        return self._focus_min
+
+    @property
+    def focus_max_speed(self) -> float:
+        return self._focus_max
+
+    @property
+    def focus_gamma(self) -> float:
+        return self._focus_gamma
+
+    @property
+    def focus_deadzone(self) -> float:
+        return self._focus_deadzone
+
+    @property
+    def focus_invert(self) -> bool:
+        return self._focus_invert
 

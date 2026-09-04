@@ -28,9 +28,11 @@ class StatusPanel(ttk.Frame):
         self,
         parent: tk.Widget,
         on_settings: Callable[[], None],
+        on_app_data: Callable[[], None] = None,
     ) -> None:
         super().__init__(parent)
         self._on_settings = on_settings
+        self._on_app_data = on_app_data
         self._dots: dict = {}
         self._labels: dict = {}
         self._build()
@@ -44,6 +46,7 @@ class StatusPanel(ttk.Frame):
         for i, (dev_id, dev_name) in enumerate([
             ("sigmakoki", "XYZ"),
             ("zolix", "XYR"),
+            ("focus", "Focus"),
             ("yudian", "Temp"),
         ]):
             dot = create_status_dot(devices_frame)
@@ -77,10 +80,14 @@ class StatusPanel(ttk.Frame):
         )
         self._gamepad_label.pack(side=tk.LEFT, padx=(0, 4))
 
-        # Settings button — right side
+        # Settings + App Data buttons — right side
         ttk.Button(
             self, text="⚙ Settings", command=self._on_settings,
-        ).pack(side=tk.RIGHT, padx=8, pady=2)
+        ).pack(side=tk.RIGHT, padx=(0, 8), pady=2)
+        if self._on_app_data:
+            ttk.Button(
+                self, text="📂 App Data", command=self._on_app_data,
+            ).pack(side=tk.RIGHT, padx=4, pady=2)
 
     # ------------------------------------------------------------------
     # Update methods
@@ -103,7 +110,7 @@ class StatusPanel(ttk.Frame):
         state = "connected" if connected else "disconnected"
         set_status_dot(dot, state)
 
-        name_map = {"sigmakoki": "XYZ", "zolix": "XYR", "yudian": "Temp"}
+        name_map = {"sigmakoki": "XYZ", "zolix": "XYR", "focus": "Focus", "yudian": "Temp"}
         name = name_map.get(device_id, device_id)
 
         label.configure(

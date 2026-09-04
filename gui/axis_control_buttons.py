@@ -164,6 +164,22 @@ class AxisControlButtons(ttk.Frame):
         if self._on_press_cb:
             self._on_press_cb(axis, direction, single_step=False)
 
+    def cancel_all_presses(self) -> None:
+        """Cancel every pending long-press timer and clear press state.
+
+        Used when the mouse is released outside a button (the toplevel
+        ButtonRelease handler) — the hold state itself is cleared by the
+        caller, so no ``on_release`` callback is fired here.
+        """
+        for timer_id in self._press_timers.values():
+            try:
+                self.winfo_toplevel().after_cancel(timer_id)
+            except Exception:
+                pass
+        self._press_timers.clear()
+        self._is_continuous.clear()
+        self._press_direction.clear()
+
     def _on_stop_press(self) -> None:
         """STOP button pressed — stop all movement on this stage."""
         if self._on_press_cb:

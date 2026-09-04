@@ -10,19 +10,10 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from copy import deepcopy
 from typing import Any, Dict
 
-# ---------------------------------------------------------------------------
-# Application base directory
-# ---------------------------------------------------------------------------
-if getattr(sys, "frozen", False):
-    _APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
-else:
-    _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-SETTINGS_FILE = os.path.join(_APP_DIR, "settings.json")
+from utils.paths import SETTINGS_FILE
 
 # ---------------------------------------------------------------------------
 # Default settings
@@ -51,7 +42,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "port": "",
         "baudrate": 115200,
         "slave_address": 1,
-        "timeout_s": 0.05,
+        "timeout_s": 0.2,
         "slow_speed_pps": 1000,
         "fast_speed_pps": 5000,
         "slow_speed_r": 500,
@@ -66,6 +57,15 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "um_per_step_r": 1.0,
         "stop_mode": "immediate",  # "decel" or "immediate"
         "ring_speeds": [500, 2500, 5000],  # slow, medium, fast (steps/sec) for stick control
+        "verbose_logging": False,
+    },
+    "focus": {
+        "port": "",
+        "min_speed": 50,     # steps/s; PC-side floor, clamped to >= 10 (firmware MIN_SPEED_SPS)
+        "max_speed": 2000,   # steps/s; applied as CFG:MAX, clamp [10, 5000]
+        "gamma": 2.2,        # response curve exponent [1.0, 4.0]
+        "deadzone": 0.05,    # trigger dead area [0.0, 0.5]
+        "invert": False,     # swap RT/LT directions
     },
     "yudian": {
         "port": "",
@@ -92,7 +92,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "input": {
         "long_press_threshold_ms": 300,
         "loop_rate_hz": 60,
-        "status_poll_rate_hz": 10,
+        "status_poll_rate_hz": 2,
     },
     "ui": {
         "window_width": 720,

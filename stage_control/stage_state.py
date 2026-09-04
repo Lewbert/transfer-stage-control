@@ -11,10 +11,10 @@ from dataclasses import dataclass, field
 from typing import Dict, Literal
 
 
-StageId = Literal["sigmakoki", "zolix"]
+StageId = Literal["sigmakoki", "zolix", "focus"]
 AxisName = Literal["x", "y", "z", "r"]
 CommandMode = Literal["single_step", "continuous_start", "continuous_stop"]
-InputSource = Literal["keyboard", "gamepad_stick", "gamepad_dpad", "gamepad_button", "ui_button"]
+InputSource = Literal["keyboard", "gamepad_stick", "gamepad_dpad", "gamepad_button", "gamepad_trigger", "ui_button"]
 
 
 @dataclass

@@ -62,14 +62,17 @@ class InputManager:
         gui_queue: queue.Queue,
         gamepad_status_queue: queue.Queue,
         loop_rate_hz: int = 60,
-        status_poll_rate_hz: int = 5,
+        status_poll_rate_hz: int = 2,
         trigger_threshold: float = 0.5,
+        ui_state_provider=None,
     ) -> None:
         self._instruments = instruments
         self._keyboard = keyboard
         self._gamepad = gamepad
         self._gui_queue = gui_queue
         self._gamepad_status_queue = gamepad_status_queue
+        # GUI-thread provider for on-screen button hold state
+        self._ui_state_provider = ui_state_provider
 
         # Resolver
         self._resolver = ActionResolver(
@@ -83,6 +86,11 @@ class InputManager:
             sigmakoki_fast_z=instruments.sigmakoki_fast_z,
             zolix_slow_r=instruments.zolix_slow_r,
             zolix_fast_r=instruments.zolix_fast_r,
+            focus_min_speed=instruments.focus_min_speed,
+            focus_max_speed=instruments.focus_max_speed,
+            focus_gamma=instruments.focus_gamma,
+            focus_deadzone=instruments.focus_deadzone,
+            focus_invert=instruments.focus_invert,
         )
 
         # Timing
@@ -151,7 +159,10 @@ class InputManager:
                 gamepad = self._gamepad.state
 
                 # 2. Resolve
-                commands = self._resolver.resolve(key_state, gamepad, now=frame_start)
+                ui_state = self._ui_state_provider() if self._ui_state_provider else None
+                commands = self._resolver.resolve(
+                    key_state, gamepad, now=frame_start, ui_state=ui_state,
+                )
 
                 # 3. Short-press detection (needs prev frame)
                 short_commands = self._resolver.resolve_short_presses(
@@ -198,10 +209,11 @@ class InputManager:
         processes special buttons to avoid double-consumption of edge
         detection state.
         """
-        # Back → toggle D-pad stage
+        # Back → toggle D-pad stage (stop the old stage's dpad moves first)
         if gamepad.just_pressed_back():
+            commands.extend(self._resolver.pop_dpad_stops())
             new_stage = "zolix" if self._resolver.dpad_stage == "sigmakoki" else "sigmakoki"
-            self._resolver.dpad_stage = new_stage  # uses setter — cleans up old state
+            self._resolver.dpad_stage = new_stage
             try:
                 self._gamepad_status_queue.put_nowait({
                     "type": "dpad_stage", "stage": new_stage,
@@ -276,7 +288,20 @@ class InputManager:
         if trigger_threshold is not None:
             kwargs["trigger_threshold"] = trigger_threshold
         self._resolver.update_speeds(**kwargs)
+        self._resolver.update_focus_config(
+            min_speed=self._instruments.focus_min_speed,
+            max_speed=self._instruments.focus_max_speed,
+            gamma=self._instruments.focus_gamma,
+            deadzone=self._instruments.focus_deadzone,
+            invert=self._instruments.focus_invert,
+        )
 
     def update_enabled(self, enabled: Dict[str, bool]) -> None:
         """Update per-stage enable state in the resolver."""
         self._resolver.update_enabled(enabled)
+
+    def cancel_continuous(self) -> None:
+        """Emergency stop of the input state: drop all continuous claims
+        and latch re-emitting sources until their inputs return to
+        neutral (called from Escape / STOP ALL buttons)."""
+        self._resolver.cancel_all_continuous()

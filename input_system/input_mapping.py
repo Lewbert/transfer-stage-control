@@ -30,7 +30,7 @@ class LogicalAction:
 
 # Define all possible logical actions
 ACTIONS = {
-    # SigmaKoki XYZ — keyboard WASD + gamepad left stick
+    # SigmaKoki XYZ — keyboard arrows (XY) / R+F (Z) + gamepad left stick
     "sk_x_pos": LogicalAction("sigmakoki", "x", +1, "SK X+"),
     "sk_x_neg": LogicalAction("sigmakoki", "x", -1, "SK X-"),
     "sk_y_pos": LogicalAction("sigmakoki", "y", +1, "SK Y+"),
@@ -38,13 +38,17 @@ ACTIONS = {
     "sk_z_pos": LogicalAction("sigmakoki", "z", +1, "SK Z+"),
     "sk_z_neg": LogicalAction("sigmakoki", "z", -1, "SK Z-"),
 
-    # Zolix XYR — keyboard arrows + gamepad right stick
+    # Zolix XYR — keyboard WASD (XY) + Q/E (R) + gamepad right stick
     "zx_x_pos": LogicalAction("zolix", "x", +1, "ZX X+"),
     "zx_x_neg": LogicalAction("zolix", "x", -1, "ZX X-"),
     "zx_y_pos": LogicalAction("zolix", "y", +1, "ZX Y+"),
     "zx_y_neg": LogicalAction("zolix", "y", -1, "ZX Y-"),
     "zx_r_pos": LogicalAction("zolix", "r", +1, "ZX R+"),
     "zx_r_neg": LogicalAction("zolix", "r", -1, "ZX R-"),
+
+    # Focus Z — keyboard +/− keys
+    "fc_z_pos": LogicalAction("focus", "z", +1, "Focus Z+"),
+    "fc_z_neg": LogicalAction("focus", "z", -1, "Focus Z-"),
 }
 
 # ===================================================================
@@ -52,35 +56,46 @@ ACTIONS = {
 # ===================================================================
 
 # Map tkinter keysym → action id
-# Note: WASD = SigmaKoki, Arrows = Zolix
+# Note: WASD = Zolix X/Y, Arrows = SigmaKoki X/Y, Q/E = Zolix R,
+#       R/F = SigmaKoki Z, +/- = Focus Z (Shift = fast).
+# Both letter cases are listed; the handler also folds case at runtime.
 KEYBOARD_MAP: Dict[str, str] = {
-    # SigmaKoki stage (WASD)
-    "w":       "sk_y_pos",    # W → move Y positive
-    "W":       "sk_y_pos",
-    "s":       "sk_y_neg",    # S → move Y negative
-    "S":       "sk_y_neg",
-    "a":       "sk_x_neg",    # A → move X negative
-    "A":       "sk_x_neg",
-    "d":       "sk_x_pos",    # D → move X positive
-    "D":       "sk_x_pos",
+    # Zolix XYR stage (WASD)
+    "w":       "zx_y_pos",    # W → Zolix Y positive
+    "W":       "zx_y_pos",
+    "s":       "zx_y_neg",    # S → Zolix Y negative
+    "S":       "zx_y_neg",
+    "a":       "zx_x_neg",    # A → Zolix X negative
+    "A":       "zx_x_neg",
+    "d":       "zx_x_pos",    # D → Zolix X positive
+    "D":       "zx_x_pos",
 
-    # Zolix stage (arrow keys)
-    "Up":      "zx_y_pos",    # Up → move Y positive
-    "Down":    "zx_y_neg",    # Down → move Y negative
-    "Left":    "zx_x_neg",    # Left → move X negative
-    "Right":   "zx_x_pos",    # Right → move X positive
-
-    # Rotation (Q/E) — Zolix R axis
+    # Zolix R rotation (Q/E)
     "q":       "zx_r_neg",    # Q → rotate negative
     "Q":       "zx_r_neg",
     "e":       "zx_r_pos",    # E → rotate positive
     "E":       "zx_r_pos",
 
-    # Z axis (U/J) — SigmaKoki Z axis
-    "u":       "sk_z_pos",    # U → Z up
-    "U":       "sk_z_pos",
-    "j":       "sk_z_neg",    # J → Z down
-    "J":       "sk_z_neg",
+    # SigmaKoki Z axis (R/F)
+    "r":       "sk_z_pos",    # R → SK Z up
+    "R":       "sk_z_pos",
+    "f":       "sk_z_neg",    # F → SK Z down
+    "F":       "sk_z_neg",
+
+    # SigmaKoki XY (arrow keys)
+    "Up":      "sk_y_pos",    # Up → SK Y positive
+    "Down":    "sk_y_neg",    # Down → SK Y negative
+    "Left":    "sk_x_neg",    # Left → SK X negative
+    "Right":   "sk_x_pos",    # Right → SK X positive
+
+    # Focus Z (+/− keys).  On a US layout "+" is Shift+"=", so "equal"
+    # is the unshifted bind and Shift naturally acts as the fast modifier.
+    "equal":       "fc_z_pos",
+    "plus":        "fc_z_pos",
+    "KP_Add":      "fc_z_pos",
+    "minus":       "fc_z_neg",
+    "underscore":  "fc_z_neg",
+    "KP_Subtract": "fc_z_neg",
 }
 
 # Keys that act as speed modifiers

@@ -8,20 +8,12 @@ Also installs a global uncaught-exception hook for crash reporting.
 from __future__ import annotations
 
 import logging
-import os
 import sys
 import traceback
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 
-# ---------------------------------------------------------------------------
-# Application base directory (handles frozen PyInstaller builds)
-# ---------------------------------------------------------------------------
-if getattr(sys, "frozen", False):
-    _APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
-else:
-    _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-LOG_FILE = os.path.join(_APP_DIR, "debug.log")
+from utils.paths import get_app_dir, LOG_FILE
 
 # ---------------------------------------------------------------------------
 # Logger setup
@@ -52,8 +44,11 @@ def setup_logging(*, level: int = logging.DEBUG) -> logging.Logger:
     root = logging.getLogger("transfer_stage")
     root.setLevel(logging.DEBUG)
 
-    # File handler — DEBUG, UTF-8, overwritten each session
-    fh = logging.FileHandler(LOG_FILE, encoding="utf-8", mode="w")
+    # File handler — DEBUG, UTF-8, rotating (keeps the previous 2 sessions
+    # so diagnostic evidence is never erased by an accidental restart)
+    fh = RotatingFileHandler(
+        LOG_FILE, encoding="utf-8", maxBytes=5_000_000, backupCount=2,
+    )
     fh.setLevel(level)
     fh.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)-7s] %(name)s: %(message)s",
@@ -88,7 +83,7 @@ def setup_logging(*, level: int = logging.DEBUG) -> logging.Logger:
 
     _log_initialized = True
     root.info("Logging initialized — log file: %s", LOG_FILE)
-    root.info("App directory: %s", _APP_DIR)
+    root.info("App data directory: %s", get_app_dir())
 
     return root
 

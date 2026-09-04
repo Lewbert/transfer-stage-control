@@ -46,6 +46,7 @@ class SettingsDialog:
         # Tabs
         self._build_device_tab(notebook, "SigmaKoki XYZ", "sigmakoki")
         self._build_device_tab(notebook, "Zolix XYR", "zolix", has_slave=True)
+        self._build_focus_tab(notebook)
         self._build_yudian_tab(notebook)
         self._build_gamepad_tab(notebook)
         self._build_input_tab(notebook)
@@ -117,7 +118,7 @@ class SettingsDialog:
 
         # Timeout
         ttk.Label(f, text="Timeout (s):").grid(row=r, column=0, sticky="w", pady=2)
-        timeout_var = tk.DoubleVar(value=cfg.get("timeout_s", 0.05))
+        timeout_var = tk.DoubleVar(value=cfg.get("timeout_s", 0.2))
         ttk.Spinbox(f, from_=0.1, to=5.0, increment=0.1, textvariable=timeout_var, width=8).grid(
             row=r, column=1, sticky="w", pady=2, padx=(8, 0),
         )
@@ -281,6 +282,90 @@ class SettingsDialog:
         self._vars[f"{prefix}_flip_xy"] = flip_var
         r += 1
 
+        # Zolix-only: verbose serial logging for stop-bug diagnosis
+        if key == "zolix":
+            verbose_var = tk.BooleanVar(value=cfg.get("verbose_logging", False))
+            ttk.Checkbutton(
+                f, text="Verbose logging (console + debug.log)", variable=verbose_var,
+            ).grid(row=r, column=0, columnspan=2, sticky="w", pady=(4, 1))
+            self._vars[f"{prefix}_verbose"] = verbose_var
+            r += 1
+
+    def _build_focus_tab(self, notebook: ttk.Notebook) -> None:
+        """Build the motorized focus module settings tab."""
+        cfg = self._settings.get("focus", {})
+        f = ttk.Frame(notebook, padding=12)
+        notebook.add(f, text="Focus")
+        f.grid_columnconfigure(0, weight=0)
+        f.grid_columnconfigure(1, weight=1)
+
+        r = 0
+        # COM Port
+        ttk.Label(f, text="COM Port:").grid(row=r, column=0, sticky="w", pady=2)
+        port_var = tk.StringVar(value=cfg.get("port", ""))
+        avail = list(self._ports)
+        if cfg.get("port") and cfg["port"] not in avail:
+            avail.insert(0, cfg["port"])
+        ttk.Combobox(f, textvariable=port_var, values=avail, width=10).grid(
+            row=r, column=1, sticky="ew", pady=2, padx=(8, 0),
+        )
+        self._vars["focus_port"] = port_var
+        r += 1
+
+        ttk.Label(f, text="Serial: 115200 8N1 (firmware-fixed)", font=FONT_SMALL).grid(
+            row=r, column=0, columnspan=2, sticky="w", pady=(0, 4),
+        )
+        r += 1
+
+        # ── Movement ──────────────────────────────────────────
+        ttk.Separator(f, orient="horizontal").grid(
+            row=r, column=0, columnspan=2, sticky="ew", pady=(8, 4),
+        )
+        r += 1
+        ttk.Label(f, text="Trigger Movement (LT/RT)", font=FONT_SMALL).grid(
+            row=r, column=0, columnspan=2, sticky="w",
+        )
+        r += 1
+
+        ttk.Label(f, text="Min Speed (steps/s):").grid(row=r, column=0, sticky="w", pady=2)
+        min_var = tk.IntVar(value=cfg.get("min_speed", 50))
+        ttk.Spinbox(f, from_=10, to=5000, textvariable=min_var, width=8).grid(
+            row=r, column=1, sticky="w", pady=2, padx=(8, 0),
+        )
+        self._vars["focus_min"] = min_var
+        r += 1
+
+        ttk.Label(f, text="Max Speed (steps/s):").grid(row=r, column=0, sticky="w", pady=2)
+        max_var = tk.IntVar(value=cfg.get("max_speed", 2000))
+        ttk.Spinbox(f, from_=10, to=5000, textvariable=max_var, width=8).grid(
+            row=r, column=1, sticky="w", pady=2, padx=(8, 0),
+        )
+        self._vars["focus_max"] = max_var
+        r += 1
+
+        ttk.Label(f, text="Gamma:").grid(row=r, column=0, sticky="w", pady=2)
+        gamma_var = tk.DoubleVar(value=cfg.get("gamma", 2.2))
+        ttk.Spinbox(f, from_=1.0, to=4.0, increment=0.1, textvariable=gamma_var, width=8).grid(
+            row=r, column=1, sticky="w", pady=2, padx=(8, 0),
+        )
+        self._vars["focus_gamma"] = gamma_var
+        r += 1
+
+        ttk.Label(f, text="Deadzone:").grid(row=r, column=0, sticky="w", pady=2)
+        dz_var = tk.DoubleVar(value=cfg.get("deadzone", 0.05))
+        ttk.Spinbox(f, from_=0.0, to=0.5, increment=0.01, textvariable=dz_var, width=8).grid(
+            row=r, column=1, sticky="w", pady=2, padx=(8, 0),
+        )
+        self._vars["focus_deadzone"] = dz_var
+        r += 1
+
+        inv_var = tk.BooleanVar(value=cfg.get("invert", False))
+        ttk.Checkbutton(
+            f, text="Invert trigger direction (swap RT/LT)", variable=inv_var,
+        ).grid(row=r, column=0, columnspan=2, sticky="w", pady=(4, 1))
+        self._vars["focus_invert"] = inv_var
+        r += 1
+
     def _build_yudian_tab(self, notebook: ttk.Notebook) -> None:
         """Build the Yudian temperature controller settings tab."""
         cfg = self._settings.get("yudian", {})
@@ -420,7 +505,7 @@ class SettingsDialog:
         r += 1
 
         ttk.Label(f, text="Status Poll Rate (Hz):").grid(row=r, column=0, sticky="w", pady=2)
-        sp_var = tk.IntVar(value=cfg.get("status_poll_rate_hz", 10))
+        sp_var = tk.IntVar(value=cfg.get("status_poll_rate_hz", 2))
         ttk.Spinbox(f, from_=1, to=20, increment=1, textvariable=sp_var, width=8).grid(
             row=r, column=1, sticky="w", pady=2, padx=(8, 0),
         )
@@ -475,6 +560,21 @@ class SettingsDialog:
                 "um_per_step_xy": float(self._vars["zolix_um_xy"].get()),
                 "um_per_step_r": float(self._vars["zolix_um_r"].get()),
                 "stop_mode": self._settings.get("zolix", {}).get("stop_mode", "immediate"),
+                "verbose_logging": self._vars["zolix_verbose"].get(),
+            }
+
+            # Focus
+            focus_min = int(self._vars["focus_min"].get())
+            focus_max = int(self._vars["focus_max"].get())
+            if focus_min >= focus_max:
+                errors.append("Focus Min Speed must be less than Max Speed.")
+            result["focus"] = {
+                "port": self._vars["focus_port"].get().strip(),
+                "min_speed": max(10, focus_min),
+                "max_speed": min(5000, focus_max),
+                "gamma": float(self._vars["focus_gamma"].get()),
+                "deadzone": float(self._vars["focus_deadzone"].get()),
+                "invert": self._vars["focus_invert"].get(),
             }
 
             # Yudian

@@ -122,6 +122,27 @@ EXC_ESTOP           = 0x08  # Emergency stop active
 EXC_NOT_ENABLED     = 0x09  # Axis not enabled
 EXC_BAD_OPCODE      = 0x0A  # Invalid opcode
 
+# --- Serial timing (lab-measured on the ZC300) ---
+MIN_SERIAL_TIMEOUT_S    = 0.15   # reply latency measured at 57-73 ms
+READ_DEADLINE_S         = 0.25   # per-transaction read deadline
+OP_RETRY_DELAY_S        = 0.05   # sleep between opcode retries (under lock)
+OP_STOP_RETRIES         = 1      # extra attempts for stops (2 total)
+OP_START_RETRIES        = 1      # extra attempts for starts (2 total)
+REEMIT_GATE_S           = 0.20   # min interval between real serial re-emissions per axis
+FAIL_BACKOFF_S          = 0.30   # suppress re-attempts after a failed start
+PRESTOP_POLL_BUDGET_S   = 0.30   # wall budget for the pre-stop motion poll
+PRESTOP_READ_TIMEOUT_S  = 0.15   # read deadline used by the pre-stop poll
+VERIFY_DELAY_S          = 0.30   # sleep before post-stop verification
+VERIFY_RECHECK_DELAY_S  = 0.20   # sleep before escalation follow-up read
+
+
+class ZolixNoResponse(ValueError):
+    """Raised when no valid MODBUS reply arrives after all retries.
+
+    Subclasses ``ValueError`` so all existing ``except ValueError``
+    handlers treat it as a failed transaction.
+    """
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -162,15 +183,25 @@ class ZolixDriver:
         baudrate: int = 115200,
         timeout: float = 0.05,
         stop_mode: str = "immediate",
+        verbose_logging: bool = False,
     ) -> None:
         self._port = port
         self._slave = slave_address
         self._baudrate = baudrate
-        self._timeout = timeout
+        # The ZC300 replies in ~60 ms — a shorter read timeout caused
+        # every transaction to time out and discard the late reply.
+        self._timeout = max(float(timeout), MIN_SERIAL_TIMEOUT_S)
         self._stop_opcode = OP_DECEL_STOP if stop_mode == "decel" else OP_IMMEDIATE_STOP
         self._ser: Optional[serial.Serial] = None
         self._connected = False
         self._lock = threading.Lock()
+
+        # Verbose transaction logging (console + debug.log) for stop-bug
+        # diagnosis.  See docs/hardware/zolix/stop_bug_analysis.md.
+        self._verbose = verbose_logging
+
+        # Post-stop verification bookkeeping
+        self._pending_stop_checks: set = set()
 
         # Track per-axis state to avoid sending motion commands to busy axes
         self._moving: Dict[str, bool] = {"x": False, "y": False, "r": False}
@@ -181,6 +212,23 @@ class ZolixDriver:
         self._last_command_time = 0.0  # for idle detection in status polling
         self._zero_offset: Dict[str, float] = {"x": 0.0, "y": 0.0, "r": 0.0}
         self._last_direction: Dict[str, int] = {"x": 0, "y": 0, "r": 0}
+        self._last_stop_time: Dict[str, float] = {"x": 0.0, "y": 0.0, "r": 0.0}
+
+        # Opcode rate limiting (per axis, monotonic clock).
+        # _last_serial_time  = updated on EVERY serial attempt (REEMIT_GATE)
+        # _last_attempt_time = updated ONLY when a start FAILS (FAIL_BACKOFF) —
+        #   a successful start must NOT arm the backoff window, or a fast
+        #   stick sweep's stop→restart gets silently dropped (the v0.4.1
+        #   "axis ends stopped on 90° change" bug).
+        self._last_opcode: Dict[str, Optional[tuple]] = {"x": None, "y": None, "r": None}
+        self._last_opcode_time: Dict[str, float] = {"x": 0.0, "y": 0.0, "r": 0.0}
+        self._last_serial_time: Dict[str, float] = {"x": 0.0, "y": 0.0, "r": 0.0}
+        self._last_attempt_time: Dict[str, float] = {"x": 0.0, "y": 0.0, "r": 0.0}
+
+        # Motion generation counter — incremented on EVERY successful
+        # motion command; used by the post-stop verify to distinguish
+        # legitimate restarts from failed stops.
+        self._motion_gen: Dict[str, int] = {"x": 0, "y": 0, "r": 0}
 
     # ------------------------------------------------------------------
     # Connection
@@ -230,6 +278,7 @@ class ZolixDriver:
             for acc_reg in (REG_ACC_X, REG_ACC_Y, REG_ACC_Z):
                 self._send_frame(
                     build_write_multiple_floats(self._slave, acc_reg, [max_acc]),
+                    expected_fn=0x10,
                 )
             logger.info("Zolix: max acceleration set (10M)")
         except Exception as exc:
@@ -268,36 +317,65 @@ class ZolixDriver:
     # ------------------------------------------------------------------
 
     def continuous_start(self, axis: str, direction: int, speed_pps: float) -> bool:
-        """Start continuous movement.  Pre-stops the axis only on direction reversal;
-        same-direction re-emissions (e.g. D-pad per-frame refresh) are handled
-        as speed-update only, avoiding unnecessary stop→start cycles."""
+        """Start continuous movement.
+
+        The resolver re-emits this every frame while an input is held;
+        the driver rate-limits real serial transactions (the ZC300 needs
+        ~60 ms each) and only pre-stops on direction changes / recent
+        stops.  A bounded motion poll waits for the pre-stop to take
+        effect before re-starting.
+        """
         if speed_pps <= 0:
             return False
 
         ax = axis.lower()
         zc300_axis = _axis_to_zc300(ax)
         direction_code = DIR_POS if direction > 0 else DIR_NEG
+        key = (direction_code, int(round(speed_pps)))
 
-        # Only pre-stop if changing direction (not on same-direction re-emission)
+        # Fast path: same opcode already active — zero serial I/O.
+        # No time window: there is nothing new to send.
+        if self._moving.get(ax) and self._last_opcode.get(ax) == key:
+            return True
+
+        now_m = time.monotonic()
+        since_serial = now_m - self._last_serial_time.get(ax, 0.0)
+        since_fail = now_m - self._last_attempt_time.get(ax, 0.0)
+        if self._moving.get(ax):
+            # A different opcode is wanted but we just did serial — the
+            # resolver re-emits every frame, so skip this one.
+            if since_serial < REEMIT_GATE_S:
+                return True
+        elif since_fail < FAIL_BACKOFF_S:
+            # A recent attempt FAILED — back off instead of re-flooding.
+            return False
+
         prev_dir = self._last_direction.get(ax, 0)
-        need_poll = False
+        recent_stop = time.time() - self._last_stop_time.get(ax, 0) < 0.1
+        need_prestop = False
+        prestop_gen = self._motion_gen.get(ax, 0)
         with self._lock:
-            if self._moving.get(ax) and direction_code != prev_dir:
-                self._stop_axis_locked(ax, zc300_axis)
-                need_poll = True
+            self._last_serial_time[ax] = time.monotonic()
+            if direction_code != prev_dir or recent_stop:
+                # Pre-stop only if the hardware says the axis is moving
+                # (bounded single read — unknown → proceed, the start
+                # attempt reveals the truth).  No post-stop verify here —
+                # a verify could fire between this stop and the new move
+                # and escalate against a move the user just commanded;
+                # if the start ultimately fails we schedule one below.
+                hw_moving = False
+                try:
+                    hw_moving = (
+                        self._read_motion_value_locked(ax, read_timeout=PRESTOP_READ_TIMEOUT_S) == 1
+                    )
+                except (ValueError, ConnectionError):
+                    pass
+                if hw_moving:
+                    self._stop_axis_locked(ax, zc300_axis, verify=False)
+                    need_prestop = True
 
-        # Poll outside lock so other threads can use serial during wait
-        if need_poll:
-            for _ in range(15):  # up to ~300 ms
-                time.sleep(0.02)
-                with self._lock:
-                    try:
-                        reg = REG_MOTION_STATE + zc300_axis
-                        val = self._read_input_register_locked(reg)
-                        if val == 0:
-                            break
-                    except Exception:
-                        break
+        if need_prestop:
+            self._wait_motion_stopped(ax)
 
         with self._lock:
             # Write speed (skip if unchanged)
@@ -308,15 +386,56 @@ class ZolixDriver:
 
             # Fire continuous move
             try:
-                self._write_opcode_block(OP_CONTINUOUS, zc300_axis, direction_code)
-                self._moving[ax] = True
-                self._last_direction[ax] = direction_code
-                return True
+                self._write_opcode_block(
+                    OP_CONTINUOUS, zc300_axis, direction_code, retries=OP_START_RETRIES,
+                )
             except ValueError as exc:
-                if "exception 6" in str(exc) or "exception 7" in str(exc):
-                    logger.warning("Zolix %s: command rejected (exc: %s)", ax, exc)
+                time.sleep(0.10)  # let the controller finish the pre-stop
+                try:
+                    self._write_opcode_block(
+                        OP_CONTINUOUS, zc300_axis, direction_code, retries=0,
+                    )
+                except ValueError as exc2:
+                    if "exception 7" in str(exc2):
+                        # At limit — the axis is definitely not moving
+                        self._moving[ax] = False
+                    logger.warning("Zolix %s: continuous start failed after retry: %s",
+                                   ax, exc2)
+                    self._last_attempt_time[ax] = time.monotonic()  # arm FAIL_BACKOFF
+                    if need_prestop:
+                        # The pre-stop may have failed (axis still moving
+                        # the old way) — verify/escalate now that no new
+                        # move was commanded.
+                        self._schedule_post_stop_check(ax, prestop_gen)
                     return False
-                raise
+
+            self._moving[ax] = True
+            self._last_direction[ax] = direction_code
+            self._last_opcode[ax] = key
+            self._last_opcode_time[ax] = time.monotonic()
+            # NOTE: _last_attempt_time deliberately NOT updated here —
+            # success must not arm FAIL_BACKOFF.
+            self._motion_gen[ax] += 1
+            return True
+
+    def _wait_motion_stopped(self, ax: str) -> None:
+        """Wait (bounded) for an axis's motion state to report stopped.
+
+        Worst case ≈ PRESTOP_POLL_BUDGET_S; the caller proceeds after the
+        budget regardless — a busy rejection on the following start is
+        absorbed by continuous_start's delayed retry.
+        """
+        deadline = time.monotonic() + PRESTOP_POLL_BUDGET_S
+        while time.monotonic() < deadline:
+            time.sleep(0.02)
+            with self._lock:
+                try:
+                    if self._read_motion_value_locked(ax, read_timeout=PRESTOP_READ_TIMEOUT_S) == 0:
+                        return
+                except (ValueError, ConnectionError):
+                    return
+        logger.debug("Zolix %s: pre-stop poll budget elapsed; proceeding "
+                     "(0x06 retry covers it)", ax)
 
     def continuous_stop(self, axis: str) -> None:
         """Stop continuous movement on a single axis."""
@@ -326,11 +445,191 @@ class ZolixDriver:
             self._stop_axis_locked(ax, zc300_axis)
 
     def stop_all(self) -> None:
-        """Stop all three axes immediately (or decel, per config)."""
+        """Stop all three axes immediately (or decel, per config).
+
+        Decel mode uses per-axis stops (0x31/0x32/0x33) — the
+        0x0067 + AXIS_ALL combination is undocumented in the manual and
+        untested on the lab unit.  Failed stops leave _moving set; the
+        post-stop verification escalates with an immediate stop.
+        """
+        now = time.time()
+        gens = dict(self._motion_gen)
         with self._lock:
-            self._write_opcode_block(self._stop_opcode, AXIS_ALL)
-            for a in ("x", "y", "r"):
-                self._moving[a] = False
+            if self._stop_opcode == OP_DECEL_STOP:
+                for a in ("x", "y", "r"):
+                    zc300_axis = _axis_to_zc300(a)
+                    self._vlog("Zolix STOP ALL (decel) cmd: opcode=0x%04X, axis=0x%02X",
+                               OP_DECEL_STOP, zc300_axis)
+                    try:
+                        self._write_opcode_block(OP_DECEL_STOP, zc300_axis,
+                                                 retries=OP_STOP_RETRIES)
+                        self._moving[a] = False
+                        self._last_stop_time[a] = now
+                        self._vlog("Zolix stop sent OK: axis=%s", a)
+                    except (ValueError, ConnectionError) as exc:
+                        logger.error("Zolix %s: stop_all (decel) failed: %s", a, exc)
+                        # leave _moving True — verification will escalate
+            else:
+                self._vlog("Zolix STOP ALL cmd: opcode=0x%04X (IMMEDIATE), "
+                           "axis_selector=0x%02X", OP_IMMEDIATE_STOP, AXIS_ALL)
+                try:
+                    self._write_opcode_block(OP_IMMEDIATE_STOP, AXIS_ALL,
+                                             retries=OP_STOP_RETRIES)
+                    self._vlog("Zolix stop_all sent OK")
+                    for a in ("x", "y", "r"):
+                        self._moving[a] = False
+                        self._last_stop_time[a] = now
+                except (ValueError, ConnectionError) as exc:
+                    logger.error("Zolix: stop_all command failed: %s", exc)
+            # Verification against hardware motion state (escalates on failure)
+            self._schedule_post_stop_check_all(gens)
+
+    # ------------------------------------------------------------------
+    # Post-stop verification (escalates with an immediate stop on failure)
+    # ------------------------------------------------------------------
+
+    def _schedule_post_stop_check(self, axis: str, gen: int) -> None:
+        """Schedule one motion-state check after a stop.  *gen* is the
+        motion-generation counter captured before the stop — a newer
+        generation at check time means the movement is a legitimate
+        restart, not a failed stop."""
+        if axis in self._pending_stop_checks:
+            return
+        self._pending_stop_checks.add(axis)
+        threading.Thread(
+            target=self._post_stop_check, args=(axis, gen),
+            daemon=True, name=f"zolix_stop_check_{axis}",
+        ).start()
+
+    def _schedule_post_stop_check_all(self, gens: Dict[str, int]) -> None:
+        """Schedule one motion-state check for all axes (per-axis gen guard)."""
+        if "all" in self._pending_stop_checks:
+            return
+        self._pending_stop_checks.add("all")
+        threading.Thread(
+            target=self._post_stop_check_all, args=(gens,),
+            daemon=True, name="zolix_stop_check_all",
+        ).start()
+
+    def _post_stop_check(self, axis: str, gen: int) -> None:
+        try:
+            time.sleep(VERIFY_DELAY_S)  # outside the lock — lets decel finish
+            with self._lock:
+                if not self.is_connected:
+                    return
+                states = self._read_motion_states_locked()
+                moving = states.get(axis, False)
+                gen_now = self._motion_gen.get(axis, 0)
+                if gen_now != gen:
+                    logger.debug(
+                        "Zolix POST-STOP VERIFY: axis %s movement is a "
+                        "legitimate restart (gen %d→%d)", axis, gen, gen_now,
+                    )
+                    return
+                if not moving:
+                    if self._moving.get(axis, False):
+                        # The stop's reply was lost but it took effect —
+                        # reconcile so the rate-limit fast path heals.
+                        self._moving[axis] = False
+                        logger.info(
+                            "Zolix POST-STOP VERIFY: axis %s stopped; "
+                            "reconciled software state", axis,
+                        )
+                    else:
+                        self._vlog("Zolix POST-STOP VERIFY: axis %s stopped (motion_state=0)", axis)
+                    return
+                logger.warning(
+                    "Zolix POST-STOP VERIFY: axis %s still moving "
+                    "(motion_state=1) — issuing immediate stop", axis,
+                )
+                try:
+                    self._write_opcode_block(
+                        OP_IMMEDIATE_STOP, _axis_to_zc300(axis), retries=OP_STOP_RETRIES,
+                    )
+                    self._moving[axis] = False
+                    self._last_stop_time[axis] = time.time()
+                except (ValueError, ConnectionError) as exc:
+                    logger.error(
+                        "Zolix POST-STOP VERIFY: escalation stop for axis %s "
+                        "failed: %s", axis, exc,
+                    )
+                    return
+            time.sleep(VERIFY_RECHECK_DELAY_S)
+            with self._lock:
+                if not self.is_connected:
+                    return
+                states = self._read_motion_states_locked()
+                if states.get(axis, False):
+                    logger.error(
+                        "Zolix POST-STOP VERIFY: axis %s STILL moving after "
+                        "escalation stop", axis,
+                    )
+                else:
+                    self._vlog("Zolix POST-STOP VERIFY: axis %s stopped after escalation", axis)
+        except Exception as exc:
+            logger.debug("Zolix post-stop check error: %s", exc)
+        finally:
+            self._pending_stop_checks.discard(axis)
+
+    def _post_stop_check_all(self, gens: Dict[str, int]) -> None:
+        try:
+            time.sleep(VERIFY_DELAY_S)  # outside the lock
+            with self._lock:
+                if not self.is_connected:
+                    return
+                states = self._read_motion_states_locked()
+                escalated = []
+                for axis in ("x", "y", "r"):
+                    if not states.get(axis, False):
+                        if self._moving.get(axis, False):
+                            self._moving[axis] = False
+                            logger.info(
+                                "Zolix POST-STOP VERIFY (all): axis %s stopped; "
+                                "reconciled software state", axis,
+                            )
+                        continue
+                    if self._motion_gen.get(axis, 0) != gens.get(axis, 0):
+                        logger.debug(
+                            "Zolix POST-STOP VERIFY (all): axis %s movement is a "
+                            "legitimate restart", axis,
+                        )
+                        continue
+                    logger.warning(
+                        "Zolix POST-STOP VERIFY (all): axis %s still moving — "
+                        "issuing immediate stop", axis,
+                    )
+                    try:
+                        self._write_opcode_block(
+                            OP_IMMEDIATE_STOP, _axis_to_zc300(axis), retries=OP_STOP_RETRIES,
+                        )
+                        self._moving[axis] = False
+                        self._last_stop_time[axis] = time.time()
+                        escalated.append(axis)
+                    except (ValueError, ConnectionError) as exc:
+                        logger.error(
+                            "Zolix POST-STOP VERIFY (all): escalation stop for "
+                            "axis %s failed: %s", axis, exc,
+                        )
+            if escalated:
+                time.sleep(VERIFY_RECHECK_DELAY_S)
+                with self._lock:
+                    if not self.is_connected:
+                        return
+                    states = self._read_motion_states_locked()
+                    still = [a for a in escalated if states.get(a, False)]
+                    if still:
+                        logger.error(
+                            "Zolix POST-STOP VERIFY (all): axes STILL moving "
+                            "after escalation: %s", still,
+                        )
+                    else:
+                        self._vlog("Zolix POST-STOP VERIFY (all): axes stopped after escalation")
+            else:
+                self._vlog("Zolix POST-STOP VERIFY (all): all axes stopped")
+        except Exception as exc:
+            logger.debug("Zolix post-stop check error: %s", exc)
+        finally:
+            self._pending_stop_checks.discard("all")
 
     def single_step(self, axis: str, direction: int, steps: int) -> int:
         """Execute a fixed-length (single step) move.
@@ -367,17 +666,24 @@ class ZolixDriver:
                 dist_reg = REG_DIST_X + (_axis_to_idx(ax) * 2)
                 self._send_frame(
                     build_write_multiple_floats(self._slave, dist_reg, [float(steps)]),
+                    expected_fn=0x10,
                 )
                 self._last_written_distance[ax] = steps
 
             # Fire fixed-length move — MUST use 0x10 per ZC300 spec
             try:
-                self._write_opcode_block(OP_FIXED_LENGTH, zc300_axis, direction_code)
+                self._write_opcode_block(
+                    OP_FIXED_LENGTH, zc300_axis, direction_code, retries=OP_START_RETRIES,
+                )
             except ValueError as exc:
                 logger.warning("Zolix single_step %s failed: %s", ax, exc)
                 return 0
 
             self._moving[ax] = True
+            # A single-step is a motion command — bump the generation so a
+            # pending post-stop verify never escalates this legit move.
+            self._motion_gen[ax] += 1
+            self._last_serial_time[ax] = time.monotonic()  # real serial, not a failure
 
         # Fire-and-forget: don't block the input loop polling for completion.
         # The status poller updates motion state for the GUI asynchronously.
@@ -489,25 +795,140 @@ class ZolixDriver:
     # Internal: Locked MODBUS I/O
     # ------------------------------------------------------------------
 
-    def _send_frame(self, frame: bytes) -> bytes:
-        """Send a MODBUS frame and wait for the response."""
+    def set_verbose(self, enabled: bool) -> None:
+        """Toggle verbose transaction logging (console + debug.log)."""
+        self._verbose = enabled
+
+    def _vlog(self, msg: str, *args) -> None:
+        """INFO-level log when verbose is enabled, DEBUG otherwise."""
+        if self._verbose:
+            logger.info(msg, *args)
+        else:
+            logger.debug(msg, *args)
+
+    def _log_frame(self, tag: str, frame: bytes, dur_ms: Optional[float] = None) -> None:
+        """Log a serial frame — full hex dump when verbose is on, otherwise
+        a compact non-hex line (keeps lab evidence in debug.log without
+        per-frame hex formatting on the input thread)."""
+        if self._verbose:
+            if dur_ms is not None:
+                self._vlog("Zolix %s frame (%d bytes, %.1f ms): %s",
+                           tag, len(frame), dur_ms, frame.hex(" "))
+            else:
+                self._vlog("Zolix %s frame (%d bytes): %s", tag, len(frame), frame.hex(" "))
+            return
+        fn = frame[1] if len(frame) > 1 else -1
+        if dur_ms is not None:
+            logger.debug("Zolix %s frame (%d bytes, fn 0x%02X, %.1f ms)",
+                         tag, len(frame), fn, dur_ms)
+        else:
+            logger.debug("Zolix %s frame (%d bytes, fn 0x%02X)", tag, len(frame), fn)
+
+    @staticmethod
+    def _extract_frame(
+        buf: bytearray, slave: int, expected_fn: Optional[int],
+    ) -> Optional[tuple]:
+        """Extract one complete, CRC-valid MODBUS frame from *buf*.
+
+        Returns ``(frame_bytes, is_stale)`` for the first complete frame
+        from *slave*, or ``None`` if nothing complete is available yet.
+        ``is_stale`` is True when the frame's function byte doesn't match
+        *expected_fn* (a reply to an earlier command).
+        """
+        for i in range(len(buf)):
+            if buf[i] != slave or len(buf) - i < 5:
+                continue
+            fn = buf[i + 1]
+            if fn & 0x80:            # exception reply: addr+fn+code+crc
+                frame_len = 5
+            elif fn in (0x06, 0x10):  # write echo: addr+fn+reg(2)+val(2)+crc
+                frame_len = 8
+            elif fn in (0x03, 0x04):  # read reply: addr+fn+count+data+crc
+                frame_len = 3 + buf[i + 2] + 2
+            else:
+                continue             # unknown fn — skip this offset
+            if len(buf) - i < frame_len:
+                return None          # incomplete frame yet
+            frame = bytes(buf[i:i + frame_len])
+            if crc16(frame[:-2]) != int.from_bytes(frame[-2:], "little"):
+                continue             # bad CRC — noise; keep scanning
+            if expected_fn is not None and fn not in (expected_fn, expected_fn | 0x80):
+                return (frame, True)  # complete but stale
+            return (frame, False)
+        return None
+
+    def _send_frame(
+        self, frame: bytes, expected_fn: Optional[int] = None,
+        read_timeout: Optional[float] = None,
+    ) -> bytes:
+        """Send a MODBUS frame and wait for a valid reply.
+
+        Reads byte-by-byte until *read_timeout* (default
+        ``READ_DEADLINE_S``) elapses, assembling complete CRC-valid
+        frames.  Complete replies to earlier commands (wrong function
+        byte vs *expected_fn*) are discarded and the wait continues —
+        a late reply is never attributed to the wrong transaction.
+        Returns ``b""`` when nothing valid arrives.
+        """
+        if self._ser is None or not self._ser.is_open:
+            raise ConnectionError("serial port not open")
+        deadline = time.monotonic() + (read_timeout if read_timeout is not None else READ_DEADLINE_S)
         try:
             self._last_command_time = time.time()
-            self._ser.reset_input_buffer()
-            self._ser.reset_output_buffer()
+            # Log-only drain of pending bytes (replaces blind
+            # reset_input_buffer, which used to discard late replies)
+            pending = b""
+            while self._ser.in_waiting > 0:
+                pending += self._ser.read(self._ser.in_waiting)
+            if pending:
+                logger.debug("Zolix drained %d stale bytes before TX: %s",
+                             len(pending), pending.hex(" "))
+
+            t0 = time.perf_counter()
             self._ser.write(frame)
             self._ser.flush()
-            time.sleep(0.002)
-            return self._ser.read(256)
+            self._log_frame("TX", frame)
+
+            buf = bytearray()
+            stale_discarded = 0
+            while time.monotonic() < deadline:
+                chunk = self._ser.read(1)  # paced by the clamped serial timeout
+                if not chunk:
+                    continue
+                buf += chunk
+                found = self._extract_frame(buf, self._slave, expected_fn)
+                if found is None:
+                    continue             # incomplete yet
+                frame_bytes, is_stale = found
+                del buf[:len(frame_bytes)]
+                if is_stale:
+                    if stale_discarded < 3:
+                        stale_discarded += 1
+                        logger.warning(
+                            "Zolix stale response discarded while waiting for "
+                            "fn 0x%02X: %s", expected_fn or 0, frame_bytes.hex(" "),
+                        )
+                    continue             # keep waiting until deadline
+                self._log_frame("RX", frame_bytes,
+                                dur_ms=(time.perf_counter() - t0) * 1000.0)
+                return frame_bytes
+
+            self._vlog("Zolix RX: no valid response to fn 0x%02X frame (%d bytes)",
+                       frame[1] if len(frame) > 1 else -1, len(frame))
+            return b""
         except (serial.SerialException, OSError) as exc:
             self._connected = False
             raise ConnectionError(f"Serial error: {exc}") from exc
 
-    def _write_opcode_block(self, opcode: int, *params: int) -> None:
+    def _write_opcode_block(
+        self, opcode: int, *params: int, retries: int = OP_STOP_RETRIES,
+    ) -> None:
         """Write an opcode command using function 0x10 (required by ZC300).
 
         Only writes the registers actually used by this opcode — the ZC300
         rejects frames with wrong register count (exception 0x03).
+        Retries on lost replies (no valid response) and busy rejections
+        (exception 0x06); never silently succeeds without a reply.
 
         Caller must hold ``_lock``.
         """
@@ -515,32 +936,75 @@ class ZolixDriver:
         frame = build_write_multiple_frame(
             self._slave, REG_OPCODE, values,
         )
-        logger.debug("Zolix opcode: 0x%04X params=%s", opcode, list(params))
-        response = self._send_frame(frame)
-        if response and len(response) >= 3 and response[1] == (0x10 | 0x80):
-            exc = response[2] if len(response) > 2 else 0
-            logger.warning("Zolix opcode 0x%04X rejected: exception 0x%02X", opcode, exc)
-            raise ValueError(f"MODBUS exception {exc}")
+        attempts = 1 + max(0, retries)
+        for attempt in range(attempts):
+            self._vlog("Zolix opcode: 0x%04X params=%s (attempt %d/%d)",
+                       opcode, list(params), attempt + 1, attempts)
+            response = self._send_frame(frame, expected_fn=0x10)
+            if not response:
+                # No valid reply — never treat as success (v0.4.0's
+                # silent-false-success bug).  Retry, then fail loudly.
+                if attempt < attempts - 1:
+                    logger.warning(
+                        "Zolix opcode 0x%04X: no valid response (attempt %d/%d) — retrying",
+                        opcode, attempt + 1, attempts,
+                    )
+                    time.sleep(OP_RETRY_DELAY_S)
+                    continue
+                raise ZolixNoResponse(
+                    f"Zolix opcode 0x{opcode:04X}: no valid response after "
+                    f"{attempts} attempt(s)"
+                )
+            if response[1] == (0x10 | 0x80):
+                exc = response[2] if len(response) > 2 else 0
+                if exc == EXC_CMD_ALARM:
+                    self._vlog(
+                        "Zolix EXC 0x%02X on opcode 0x%04X — axis busy / "
+                        "new-motion-forbidden", exc, opcode,
+                    )
+                logger.warning("Zolix opcode 0x%04X rejected: exception 0x%02X "
+                               "(response: %s)", opcode, exc, response.hex(" "))
+                if exc == EXC_CMD_ALARM and attempt < attempts - 1:
+                    # Busy — retry after a short delay
+                    time.sleep(OP_RETRY_DELAY_S)
+                    continue
+                raise ValueError(f"MODBUS exception {exc}")
+            return  # clean 0x10 echo
 
     def _write_single_locked(self, register: int, value: int) -> None:
         """Write a single holding register (caller must hold _lock)."""
         frame = build_write_single_frame(self._slave, register, value)
-        self._send_frame(frame)
+        response = self._send_frame(frame, expected_fn=0x06)
+        if not response:
+            raise ZolixNoResponse(
+                f"Zolix write-single register {register}: no valid response"
+            )
 
-    def _read_input_register_locked(self, register: int) -> int:
+    def _read_input_register_locked(
+        self, register: int, read_timeout: Optional[float] = None,
+    ) -> int:
         """Read a single input register, return signed 16-bit (caller must hold _lock)."""
         frame = build_read_frame(self._slave, 0x04, register, count=1)
-        response = self._send_frame(frame)  # waits for response
+        response = self._send_frame(frame, expected_fn=0x04, read_timeout=read_timeout)
         raw = (response[3] << 8) | response[4]
         if raw > 32767:
             raw -= 65536
         return raw
 
-    def _read_input_registers_locked(self, start_register: int, count: int) -> list[int]:
+    def _read_input_registers_locked(
+        self, start_register: int, count: int, read_timeout: Optional[float] = None,
+    ) -> list[int]:
         """Read multiple input registers (caller must hold _lock)."""
         frame = build_read_frame(self._slave, 0x04, start_register, count=count)
-        response = self._send_frame(frame)  # waits for response
+        response = self._send_frame(frame, expected_fn=0x04, read_timeout=read_timeout)
         return parse_multi_read_response(response, 0x04)
+
+    def _read_motion_value_locked(
+        self, axis: str, read_timeout: Optional[float] = None,
+    ) -> int:
+        """Read one axis's motion-state register (0=stopped, 1=moving)."""
+        reg = REG_MOTION_STATE + _axis_to_idx(axis)
+        return self._read_input_register_locked(reg, read_timeout=read_timeout)
 
     def _read_input_register(self, register: int) -> int:
         """Read a single input register (acquires lock)."""
@@ -565,16 +1029,41 @@ class ZolixDriver:
         const_reg = REG_SPEED_CONST_X + (idx * 2)
 
         if abs(speed_pps - self._last_written_speed.get(axis, -1)) > 0.5:
-            self._send_frame(
+            response = self._send_frame(
                 build_write_multiple_floats(self._slave, const_reg, [speed_pps]),
+                expected_fn=0x10,
             )
+            if not response:
+                raise ZolixNoResponse(
+                    f"Zolix speed write for {axis}: no valid response"
+                )
             self._last_written_speed[axis] = speed_pps
 
-    def _stop_axis_locked(self, axis: str, zc300_axis: int) -> None:
-        """Stop a single axis.  Response wait in _send_frame naturally
-        spaces commands — the next command only fires after ZC300 echoes."""
-        self._write_opcode_block(self._stop_opcode, zc300_axis)
+    def _stop_axis_locked(self, axis: str, zc300_axis: int, verify: bool = True) -> None:
+        """Stop a single axis.  State is only updated on success — a failed
+        stop must not clear _moving, or the resolver will think the axis
+        stopped when it didn't.  The post-stop verification escalates
+        with an immediate stop when the hardware keeps moving.
+        *verify* is False for pre-stops inside ``continuous_start`` (the
+        follow-up start is verified by its own retry logic instead)."""
+        gen = self._motion_gen.get(axis, 0)
+        stop_name = "DECEL" if self._stop_opcode == OP_DECEL_STOP else "IMMEDIATE"
+        self._vlog("Zolix STOP cmd: opcode=0x%04X (%s), axis=0x%02X",
+                   self._stop_opcode, stop_name, zc300_axis)
+        try:
+            self._write_opcode_block(self._stop_opcode, zc300_axis,
+                                     retries=OP_STOP_RETRIES)
+        except (ValueError, ConnectionError) as exc:
+            logger.error("Zolix %s: stop command failed after retries: %s", axis, exc)
+            # leave _moving True — verification will escalate
+            if verify:
+                self._schedule_post_stop_check(axis, gen)
+            return
         self._moving[axis] = False
+        self._last_stop_time[axis] = time.time()
+        self._vlog("Zolix stop sent OK: axis=%s", axis)
+        if verify:
+            self._schedule_post_stop_check(axis, gen)
 
     # ------------------------------------------------------------------
     # Parameters

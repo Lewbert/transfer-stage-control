@@ -41,8 +41,20 @@ class KeyboardHandler:
 
         # Callbacks for global actions (Escape = STOP ALL)
         self._global_callbacks: Dict[str, Callable] = {}
+        self._global_held: Set[str] = set()   # global keys currently held
+        self._focus_out_gen = 0               # generation for deferred FocusOut check
 
         self._bind()
+
+    @staticmethod
+    def _normalize_keysym(keysym: str) -> str:
+        """Single-letter keysyms arrive as 'w' normally but as 'W' once
+        Shift is held (auto-repeat/release) — normalize so press and
+        release update the same state entry (fixes stuck keys and broken
+        short-press detection)."""
+        if len(keysym) == 1 and keysym.isalpha():
+            return keysym.lower()
+        return keysym
 
     # ------------------------------------------------------------------
     # Binding
@@ -67,30 +79,52 @@ class KeyboardHandler:
 
     def _on_key_press(self, event: tk.Event) -> None:
         """Record a key press."""
-        keysym = event.keysym
+        keysym = self._normalize_keysym(event.keysym)
+        # Global callbacks FIRST — Escape is not in _tracked_keys, and the
+        # old code returned before this lookup so Escape never fired.
+        cb = self._global_callbacks.get(keysym)
+        if cb is not None:
+            with self._lock:
+                was_held = keysym in self._global_held
+                self._global_held.add(keysym)
+            if not was_held:  # fire once per press, not on auto-repeat
+                cb()
         if keysym not in self._tracked_keys:
             return
-        # Check for global callbacks
-        cb = self._global_callbacks.get(keysym)
-        if cb:
-            cb()
         with self._lock:
             if self._key_state.get(keysym, 0) == 0:
                 self._key_state[keysym] = time.perf_counter()
 
     def _on_key_release(self, event: tk.Event) -> None:
         """Record a key release."""
-        keysym = event.keysym
+        keysym = self._normalize_keysym(event.keysym)
+        if keysym in self._global_callbacks:
+            with self._lock:
+                self._global_held.discard(keysym)
         if keysym not in self._tracked_keys:
             return
         with self._lock:
             self._key_state[keysym] = 0
 
     def _on_focus_out(self, event: tk.Event) -> None:
-        """Clear all keys when focus is lost (prevents stuck keys)."""
-        with self._lock:
+        """Deferred focus check: only clear keys when the WHOLE window
+        lost focus (not when focus moved between widgets, e.g. clicking
+        an on-screen button while holding a movement key)."""
+        self._focus_out_gen += 1
+        self._root.after(50, lambda g=self._focus_out_gen: self._focus_out_recheck(g))
+
+    def _focus_out_recheck(self, gen: int) -> None:
+        if gen != self._focus_out_gen:
+            return
+        try:
+            if self._root.focus_get() is not None:
+                return  # focus moved to a child widget — keys stay held
+        except Exception:
+            pass
+        with self._lock:  # whole window lost focus — clear everything
             for key in self._tracked_keys:
                 self._key_state[key] = 0
+            self._global_held.clear()
 
     # ------------------------------------------------------------------
     # Global action callbacks
